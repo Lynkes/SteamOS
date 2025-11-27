@@ -1,568 +1,559 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 2; -*-
 # vim: et sts=2 sw=2
 #
-# A collection of functions to create, repair, or modify a SteamOS installation.
-# This makes a number of assumptions about the target device and will be
-# destructive if you have modified the expected partition layout.
+# Improved: safer error handling, argument parsing, validation, dry-run, no-infinite-sleep
 #
-
-set -eu
-
-die() { echo >&2 "!! $*"; exit 1; }
-readvar() { IFS= read -r -d '' "$1" || true; }
-
-DISK=/dev/nvme0n1
-DISK_SUFFIX=p
+# tornar o script mais seguro e parar em erros
+set -euo pipefail
+# trap para mostrar linha do erro e pausar para inspeção
+trap 'echo "[ERRO] Script abortado na linha $LINENO"; read -r -p "Pressione ENTER para sair..."' ERR
+set -o nounset
+set -o pipefail
+# --- Configuration (edit as needed) ---
+DISK_DEFAULT="/dev/nvme0n1"
+DISK_SUFFIX="p"
 DOPARTVERIFY=1
 
-# If this exists, use the jupiter-biosupdate binary from this directory, and set JUPITER_BIOS_DIR to this directory when
-# invoking it.  Used for including a newer bios payload than the base image.
-VENDORED_BIOS_UPDATE=/home/deck/jupiter-bios
-# If this exists, use the jupiter-controller-update binary from this directory, and set
-# JUPITER_CONTROLLER_UPDATE_FIRMWARE_DIR to this directory when invoking it.  Used for including a newer controller
-# payload than the base image.
-VENDORED_CONTROLLER_UPDATE=/home/deck/jupiter-controller-fw
+VENDORED_BIOS_UPDATE="/home/deck/jupiter-bios"
+VENDORED_CONTROLLER_UPDATE="/home/deck/jupiter-controller-fw"
 
-# Partition table, sfdisk format, %%DISKPART%% filled in
-#
 PART_SIZE_ESP="256"
 PART_SIZE_EFI="64"
-PART_SIZE_ROOT="5120" # This should match the size from the input disk build
+PART_SIZE_ROOT="5120"
 PART_SIZE_VAR="256"
-PART_SIZE_HOME="100" # For the stub .img file we're making this can be tiny, OS expands to fill physical disk on first
-                     # boot.  We make sure to specify the inode ratio explicitly when formatting.
+PART_SIZE_HOME="100"
 
-# Total size + 1MiB padding at beginning/end for GPT structures.
-DISK_SIZE=$(( 2 + PART_SIZE_HOME + PART_SIZE_ESP + 2 * ( PART_SIZE_EFI + PART_SIZE_ROOT + PART_SIZE_VAR ) ))
-# Alignment: Using general sizes like MiB and no explicit start offset points causes sfdisk to align to MiB boundaries
-#            by default (e.g. first partition will start at 1MiB). See `man sfdisk`.
+TARGET_SECTOR_SIZE=512
+# -------------------------------------
 
-# Sector size: Most physical SSD/NVMe/etc use logical 512 sectors*. GPT partition tables aren't portable between varying
-#              sector sizes, so this .img cannot be used directly on a 4k-logical-sector device (a quick search suggests
-#              this is most likely with certain VM/cloud/network disks)
-#
+# runtime flags (modifiable via CLI)
+DRYRUN=0
+PROMPT=1
+FORCEBIOS=0
+POWEROFF=0
 
-#              Since we use 1MiB alignment, it should be possible to fixup this partition table for other sector sizes
-#              without physically moving any partitions at imaging time:
-#
-#                  dd if=output.img of=/target/disk
-#
-#                  # sfdisk will default to 512 for a local file, dumping the table correctly, then translate it to the
-#                  # target device's sector size upon re-writing:
-#
-#                  sfdisk -d < output.img | sfdisk /target/disk
-#
-#              Alternatively, use `losetup --sector-size` to remount the image at a different size, and use the above
-#              steps to regenerate the table.  If this comes up often in practice we could output a "partitions4096.gpt"
-#              style file alongside the disk image that could be `dd`'d on top for weird VM setups.
-#
-#              *Note: logical sectors != physical sectors != optimal I/O alignment.  Logical sectors being the unit the
-#               OS addresses the disk by, and what GPT tables use as their basic written-to-disk unit.  Most everything
-#               is 512 or (rarely) 4096.
+# computed values – initialized but may be replaced by autodetect
+DISK="$DISK_DEFAULT"
+DISKPART_SEP="${DISK_SUFFIX:-}"
 
-TARGET_SECTOR_SIZE=512 # Passed to `losetup` to emulate, affects the sector-offsets sfdisk ends up writing.
-readvar PARTITION_TABLE <<END_PARTITION_TABLE
-  label: gpt
-  %%DISKPART%%1: name="esp",      size=         ${PART_SIZE_ESP}MiB,  type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-  %%DISKPART%%2: name="efi-A",    size=         ${PART_SIZE_EFI}MiB,  type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
-  %%DISKPART%%3: name="efi-B",    size=         ${PART_SIZE_EFI}MiB,  type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
-  %%DISKPART%%4: name="rootfs-A", size=         ${PART_SIZE_ROOT}MiB, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
-  %%DISKPART%%5: name="rootfs-B", size=         ${PART_SIZE_ROOT}MiB, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
-  %%DISKPART%%6: name="var-A",    size=         ${PART_SIZE_VAR}MiB,  type=4D21B016-B534-45C2-A9FB-5C16E091FD2D
-  %%DISKPART%%7: name="var-B",    size=         ${PART_SIZE_VAR}MiB,  type=4D21B016-B534-45C2-A9FB-5C16E091FD2D
-  %%DISKPART%%8: name="home",     size=         ${PART_SIZE_HOME}MiB, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915
-END_PARTITION_TABLE
-
-# Partition numbers on ideal target device, by index
-FS_ESP=1
-FS_EFI_A=2
-FS_EFI_B=3
-FS_ROOT_A=4
-FS_ROOT_B=5
-FS_VAR_A=6
-FS_VAR_B=7
-FS_HOME=8
-
-diskpart() { echo "$DISK$DISK_SUFFIX$1"; }
-
-##
-## Util colors and such
-##
-
-err() {
-  echo >&2
-  eerr "Imaging error occured, see above and restart process."
-  sleep infinity
+# helper: ajusta separador de partição conforme o tipo de disco
+set_diskpart_sep() {
+  if [[ "$DISK" =~ ^/dev/nvme ]]; then
+    DISKPART_SEP="p"
+  else
+    DISKPART_SEP=""
+  fi
 }
-trap err ERR
 
+# valida o disco existe
+if [[ ! -b "$DISK" ]]; then
+  die "Disk $DISK does not exist. Ajuste --disk." 6
+fi
+
+# configura separador final ('' para sda, 'p' para nvme)
+set_diskpart_sep
+
+# ----- FUNÇÃO DISKPART CORRETA -----
+# Garante 100% "/dev/sda6" e não "/dev/sdap6"
+diskpart() { printf "%s%s%d" "$DISK" "$DISKPART_SEP" "$1"; }
+
+# ----- SUBSTITUIÇÃO CORRETA %%DISKPART%% -----
+# sfdisk NÃO quer /dev/sda1; a tabela usa somente prefixo (/dev/sda)
+# Exemplo: "%%DISKPART%%6:" vira "/dev/sda6:"
+
+# helper: print to stderr with color if supported
 _sh_c_colors=0
-[[ -n $TERM && -t 1 && ${TERM,,} != dumb ]] && _sh_c_colors="$(tput colors 2>/dev/null || echo 0)"
+[[ -n ${TERM-} && -t 2 && ${TERM,,} != dumb ]] && _sh_c_colors="$(tput colors 2>/dev/null || echo 0)"
 sh_c() { [[ $_sh_c_colors -le 0 ]] || ( IFS=\; && echo -n $'\e['"${*:-0}m"; ); }
+log()    { echo >&2 "$(sh_c 32 1)::$(sh_c) $*"; }
+info()   { echo >&2 "$(sh_c 34 1)::$(sh_c) $*"; }
+warn()   { echo >&2 "$(sh_c 33 1);;$(sh_c) $*"; }
+error()  { echo >&2 "$(sh_c 31 1)!!$(sh_c) $*"; }
+die()    { local rc=${2-1}; error "$1"; exit "$rc"; }
 
-sh_quote() { echo "${@@Q}"; }
-estat()    { echo >&2 "$(sh_c 32 1)::$(sh_c) $*"; }
-emsg()     { echo >&2 "$(sh_c 34 1)::$(sh_c) $*"; }
-ewarn()    { echo >&2 "$(sh_c 33 1);;$(sh_c) $*"; }
-einfo()    { echo >&2 "$(sh_c 30 1)::$(sh_c) $*"; }
-eerr()     { echo >&2 "$(sh_c 31 1)!!$(sh_c) $*"; }
-die() { local msg="$*"; [[ -n $msg ]] || msg="script terminated"; eerr "$msg"; exit 1; }
-showcmd() { showcmd_unquoted "${@@Q}"; }
-showcmd_unquoted() { echo >&2 "$(sh_c 30 1)+$(sh_c) $*"; }
-cmd() { showcmd "$@"; "$@"; }
-
-# Helper to format
-fmt_ext4()  { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd sudo mkfs.ext4 -F -L "$1" "$2"; }
-fmt_fat32() { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd sudo mkfs.vfat -n"$1" "$2"; }
-
-##
-## Prompt mechanics - currently using Zenity
-##
-
-# Give the user a choice between Proceed, or Cancel (which exits this script)
-#  $1 Title
-#  $2 Text
-#
-prompt_step()
-{
-  title="$1"
-  msg="$2"
-  unconditional="${3-}"
-  if [[ ! ${unconditional-} && ${NOPROMPT:-} ]]; then
-    echo -e "$msg"
+# Dry-run wrapper for commands
+run_cmd() {
+  if [[ $DRYRUN -eq 1 ]]; then
+    info "[DRYRUN] $*"
     return 0
   fi
-  zenity --title "$title" --question --ok-label "Proceed" --cancel-label "Cancel" --no-wrap --text "$msg"
-  [[ $? = 0 ]] || exit 1
+  info "+ $*"
+  "$@"
 }
 
-prompt_reboot()
-{
-  local msg=$1
-  local mode="reboot"
-  [[ ${POWEROFF:-} ]] && mode="shutdown"
+# Check required binaries early
+require_cmds() {
+  local miss=0
+  for cmd in sfdisk dd mkfs.ext4 mkfs.vfat blkid steamos-chroot nvme; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      error "Required command not found: $cmd"
+      miss=1
+    fi
+  done
+  [[ $miss -eq 0 ]] || die "Install missing dependencies and re-run."
+}
 
-  prompt_step "Action Successful" "${msg}\n\nChoose Proceed to $mode now, or Cancel to stay in the repair image." "${REBOOTPROMPT:-}"
-  [[ $? = 0 ]] || exit 1
-  if [[ ${POWEROFF:-} ]]; then
-    cmd systemctl poweroff
+# argument parsing (simple)
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [options] <target>
+Targets: all | system | home | chroot | sanitize
+Options:
+  --disk /dev/sdX     target disk (default: $DISK_DEFAULT)
+  --no-prompt         don't show GUI prompts; use console confirmations
+  --dry-run           show actions but don't execute
+  --force-bios        pass FORCEBIOS
+  --poweroff          poweroff after finishing (default: reboot)
+EOF
+  exit 1
+}
+
+# small prompt fallback (zenity optional)
+prompt_step() {
+  local title="$1"; local msg="$2"; local unconditional="${3-}"
+  if [[ $PROMPT -eq 0 ]]; then
+    echo -e "$title: $msg"
+    return 0
+  fi
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --title "$title" --question --ok-label "Proceed" --cancel-label "Cancel" --no-wrap --text "$msg" || exit 1
   else
-    cmd systemctl reboot
+    # console fallback
+    echo -e "$title\n\n$msg"
+    read -r -p "Proceed? [y/N] " ans
+    [[ "${ans,,}" = "y" ]] || exit 1
   fi
 }
 
-##
-## Repair functions
-##
-
-# verify partition on target disk - at least make sure the type and partlabel match what we expect.
-#   $1 device
-#   $2 expected type
-#   $3 expected partlabel
-#
-verifypart()
-{
-  [[ $DOPARTVERIFY = 1 ]] || return 0
-  TYPE="$(blkid -o value -s TYPE "$1" )"
-  PARTLABEL="$(blkid -o value -s PARTLABEL "$1" )"
-  if [[ ! $TYPE = "$2" ]]; then
-    eerr "Device $1 is type $TYPE but expected $2 - cannot proceed. You may try full recovery."
-    sleep infinity ; exit 1
+# safe mount/umount helpers
+safe_mount() {
+  local dev="$1"; local target="$2"
+  if mountpoint -q "$target"; then
+    info "$target already mounted"
+    return 0
   fi
-
-  if [[ ! $PARTLABEL = $3 ]] ; then 
-    eerr "Device $1 has label $PARTLABEL but expected $3 - cannot proceed. You may try full recovery."
-    sleep infinity ; exit 2
+  run_cmd sudo mount "$dev" "$target"
+}
+safe_umount() {
+  local target="$1"
+  if mountpoint -q "$target"; then
+    run_cmd sudo umount -l "$target"
   fi
 }
 
-# Replace the device rootfs (btrfs version). Source must be frozen before calling.
-#   $1 source device
-#   $2 target device
-#
-imageroot()
-{
-  local srcroot="$1"
-  local newroot="$2"
-  # copy then randomize target UUID - careful here! Duplicating btrfs ids is a problem
-  cmd dd if="$srcroot" of="$newroot" bs=128M status=progress oflag=sync
-  cmd btrfstune -f -u "$newroot"
-  cmd btrfs check "$newroot"
-}
-
-# Set up boot configuration in the target partition set
-#   $1 partset name
-finalize_part()
-{
-  estat "Finalizing install part $1"
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- mkdir /efi/SteamOS
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- mkdir -p /esp/SteamOS/conf
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- steamos-partsets /efi/SteamOS/partsets
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- steamos-bootconf create --image "$1" --conf-dir /esp/SteamOS/conf --efi-dir /efi --set title "$1"
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- grub-mkimage
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- update-grub
-}
-
-##
-## Main
-##
-
-onexit=()
+# improved trap/cleanup
+onexit_funcs=()
+register_onexit() { onexit_funcs+=("$1"); }
 exithandler() {
-  for func in "${onexit[@]}"; do
-    "$func"
+  local f
+  for f in "${onexit_funcs[@]}"; do
+    "$f" || true
   done
 }
 trap exithandler EXIT
 
-# Check existence of target disk
-if [[ ! -e "$DISK" ]]; then
-  eerr "$DISK does not exist -- no nvme drive detected?"
-  sleep infinity
-  exit 1
+# partition-table template
+read -r -d '' PARTITION_TABLE <<EOF || true
+label: gpt
+%%DISKPART%%1: name="esp",      size=         ${PART_SIZE_ESP}MiB,  type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+%%DISKPART%%2: name="efi-A",    size=         ${PART_SIZE_EFI}MiB,  type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+%%DISKPART%%3: name="efi-B",    size=         ${PART_SIZE_EFI}MiB,  type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+%%DISKPART%%4: name="rootfs-A", size=         ${PART_SIZE_ROOT}MiB, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
+%%DISKPART%%5: name="rootfs-B", size=         ${PART_SIZE_ROOT}MiB, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
+%%DISKPART%%6: name="var-A",    size=         ${PART_SIZE_VAR}MiB,  type=4D21B016-B534-45C2-A9FB-5C16E091FD2D
+%%DISKPART%%7: name="var-B",    size=         ${PART_SIZE_VAR}MiB,  type=4D21B016-B534-45C2-A9FB-5C16E091FD2D
+%%DISKPART%%8: name="home",     size=         ${PART_SIZE_HOME}MiB, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915
+EOF
+
+# partition helpers
+diskpart() { printf "%s%s%d" "$DISK" "$DISKPART_SEP" "$1"; }
+
+# verify partition - safer messages, avoid infinity sleeps
+verifypart() {
+  [[ $DOPARTVERIFY -eq 1 ]] || return 0
+  local dev="$1" expected_type="$2" expected_label="$3"
+  local type partlabel
+  type="$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)"
+  partlabel="$(blkid -o value -s PARTLABEL "$dev" 2>/dev/null || true)"
+  if [[ -z "$type" ]]; then
+    die "blkid didn't report TYPE for $dev (exists? readable?)" 2
+  fi
+  if [[ "$type" != "$expected_type" ]]; then
+    die "Device $dev is type $type but expected $expected_type - aborting." 3
+  fi
+  if [[ "$partlabel" != "$expected_label" ]]; then
+    die "Device $dev has PARTLABEL '$partlabel' but expected '$expected_label' - aborting." 4
+  fi
+}
+
+# format helpers (use run_cmd wrapper)
+fmt_ext4()  { [[ $# -eq 2 ]] || die "fmt_ext4 usage"; run_cmd sudo mkfs.ext4 -F -L "$1" "$2"; }
+fmt_fat32() { [[ $# -eq 2 ]] || die "fmt_fat32 usage"; run_cmd sudo mkfs.vfat -n"$1" "$2"; }
+
+# image root copy (btrfs aware)
+imageroot() {
+  local src="$1" dst="$2"
+  [[ -b "$dst" || -f "$dst" ]] || die "Target $dst doesn't exist"
+  run_cmd sudo dd if="$src" of="$dst" bs=128M status=progress oflag=sync
+  # only attempt btrfstune if output looks like btrfs
+  if file -s "$dst" | grep -qi btrfs; then
+    run_cmd sudo btrfstune -f -u "$dst"
+    run_cmd sudo btrfs check "$dst" || warn "btrfs check returned non-zero"
+  fi
+}
+
+# finalize partition (boot setup)
+finalize_part() {
+  local partset="$1"
+  info "Finalizing install part $partset"
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- mkdir -p /efi/SteamOS
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- mkdir -p /esp/SteamOS/conf
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- steamos-partsets /efi/SteamOS/partsets
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- steamos-bootconf create --image "$partset" --conf-dir /esp/SteamOS/conf --efi-dir /efi --set title "$partset"
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- grub-mkimage || warn "grub-mkimage returned non-zero (non-fatal)"
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- update-grub || warn "update-grub returned non-zero (non-fatal)"
+}
+
+
+
+# install nvidia drivers inside a partset (kept much of original logic)
+# install nvidia drivers inside a partset
+install_nvidia_drivers() {
+  local part="$1"
+  info "Installing Nvidia drivers inside partset $part"
+  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$part" -- bash -e <<'CHROOT_EOF' || true
+set -euo pipefail
+
+echo "[NVIDIA] Attempting to initialize keyring and refresh packages"
+
+if command -v pacman-key >/dev/null 2>&1; then
+  pacman-key --init 2>/dev/null || true
+  pacman-key --populate archlinux 2>/dev/null || true
 fi
 
-# Reinstall a fresh SteamOS copy.
-#
-repair_steps()
-{
-  if [[ $writePartitionTable = 1 ]]; then
-    estat "Write known partition table"
-    echo "$PARTITION_TABLE" | sfdisk "$DISK"
+# --- BLOCO SUBSTITUÍDO (pacman) ---
+if command -v pacman >/dev/null 2>&1; then
+  pacman -Sy --noconfirm || true
+  pacman -S --noconfirm nvidia-dkms nvidia-utils linux-headers lib32-nvidia-utils || true
+fi
+# --- FIM DO BLOCO ---
 
-  elif [[ $writeOS = 1 || $writeHome = 1 ]]; then
-
-    # verify some partition settings to make sure we are ok to proceed with partial repairs
-    # in the case we just wrote the partition table, we know we are good and the partitions
-    # are unlabelled anyway
-    verifypart "$(diskpart $FS_ESP)" vfat esp
-    verifypart "$(diskpart $FS_EFI_A)" vfat efi-A
-    verifypart "$(diskpart $FS_EFI_B)" vfat efi-B
-    verifypart "$(diskpart $FS_VAR_A)" ext4 var-A
-    verifypart "$(diskpart $FS_VAR_B)" ext4 var-B
-    verifypart "$(diskpart $FS_HOME)" ext4 home
-  fi
-
-  # clear the var partition (user data), but also if we are reinstalling the OS
-  # a fresh system partition has problems with overlay otherwise
-  if [[ $writeOS = 1 || $writeHome = 1 ]]; then
-    estat "Creating var partitions"
-    fmt_ext4  var  "$(diskpart $FS_VAR_A)"
-    fmt_ext4  var  "$(diskpart $FS_VAR_B)"
-  fi
-
-  # Create boot partitions
-  if [[ $writeOS = 1 ]]; then
-    # Set up ESP/EFI boot partitions
-    estat "Creating boot partitions"
-    fmt_fat32 esp  "$(diskpart $FS_ESP)"
-    fmt_fat32 efi  "$(diskpart $FS_EFI_A)"
-    fmt_fat32 efi  "$(diskpart $FS_EFI_B)"
-  fi
-
-  if [[ $writeHome = 1 ]]; then
-    estat "Creating home partition..."
-    cmd sudo mkfs.ext4 -F -O casefold -T huge -L home "$(diskpart $FS_HOME)"
-    estat "Remove the reserved blocks on the home partition..."
-    tune2fs -m 0 "$(diskpart $FS_HOME)"
-  fi
-
-  # Stage a BIOS update for next reboot if updating OS. OOBE images like this one don't auto-update the bios on boot.
-  if [[ $writeOS = 1 ]]; then
-    estat "Staging a BIOS update for next boot if necessary"
-    # If we included a VENDORED_BIOS_UPDATE directory above, use the newer payload there and point JUPITER_BIOS_DIR to
-    # it.  Directory should contain both a newer tool and newer firmware.
-    biostool=/usr/bin/jupiter-biosupdate
-    if [[ -n $VENDORED_BIOS_UPDATE && -d $VENDORED_BIOS_UPDATE ]]; then
-      biostool="$VENDORED_BIOS_UPDATE"/jupiter-biosupdate
-      export JUPITER_BIOS_DIR="$VENDORED_BIOS_UPDATE"
-    fi
-
-    # This is cursed, but, we want to stage the capsule in the onboard nvme, which we are booting next
-    fix_esp() {
-      if [[ -n $mounted_esp ]]; then
-        cmd umount -l /esp
-        cmd umount -l /boot/efi
-        mounted_esp=
-      fi
-    }
-    onexit+=(fix_esp)
-    einfo "Mounting new ESP/EFI on /esp /boot/efi for BIOS staging"
-    cmd mount "$(diskpart $FS_ESP)" /esp
-    cmd mount "$(diskpart $FS_EFI_A)" /boot/efi
-    mounted_esp=1
-
-    if [[ ${FORCEBIOS:-} ]]; then
-      "$biostool" --force || "$biostool"
-    else
-      "$biostool"
-    fi
-
-    fix_esp
-  fi
-
-  # Perform a controller update if updating OS.  OOBE images like this one don't auto-update controllers on boot.
-  if [[ $writeOS = 1 ]]; then
-    estat "Updating controller firmware if necessary"
-    controller_tool="/usr/bin/jupiter-controller-update"
-    # If we included a VENDORED_CONTROLLER_UPDATE directory above, use the newer payload and point
-    # JUPITER_CONTROLLER_UPDATE_FIRMWARE_DIR to it.  Directory should contain both a newer tool and newer firmware.
-    if [[ -n $VENDORED_CONTROLLER_UPDATE && -d $VENDORED_CONTROLLER_UPDATE ]]; then
-      controller_tool="$VENDORED_CONTROLLER_UPDATE"/jupiter-controller-update
-      export JUPITER_CONTROLLER_UPDATE_FIRMWARE_DIR="$VENDORED_CONTROLLER_UPDATE"
-    fi
-
-    JUPITER_CONTROLLER_UPDATE_IN_OOBE=1 "$controller_tool"
-  fi
-
-  if [[ $writeOS = 1 ]]; then
-    # Find rootfs
-    rootdevice="$(findmnt -n -o source / )"
-    if [[ -z $rootdevice || ! -e $rootdevice ]]; then
-      eerr "Could not find USB installer root -- usb hub issue?"
-      sleep infinity
-      exit 1
-    fi
-
-    # Freeze our rootfs
-    estat "Freezing rootfs"
-    unfreeze() { fsfreeze -u /; }
-    onexit+=(unfreeze)
-    cmd fsfreeze -f /
-
-    estat "Imaging OS partition A"
-    imageroot "$rootdevice" "$(diskpart $FS_ROOT_A)"
-  
-    estat "Imaging OS partition B"
-    imageroot "$rootdevice" "$(diskpart $FS_ROOT_B)"
-
-    estat "Adding Nvidia proprietary driver support (latest version)"
-
-    install_nvidia_drivers() {
-  local part="$1"
-  estat "Installing Nvidia drivers inside partset $part"
-
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$part" -- bash -e <<'CHROOT_EOF'
-    set -euo pipefail
-
-    echo "[NVIDIA] Ensuring pacman keyring initialized (if applicable)"
-    if command -v pacman-key >/dev/null 2>&1; then
-      if ! test -d /etc/pacman.d/gnupg || ! rpm -q --quiet pacman 2>/dev/null; then
-        : # continue; different distros may vary — attempt init if needed
-      fi
-      pacman-key --init 2>/dev/null || true
-      pacman-key --populate archlinux 2>/dev/null || true
-    fi
-
-    echo "[NVIDIA] Refreshing package databases"
-    pacman --noconfirm -Sy
-
-    echo "[NVIDIA] Installing driver packages"
-    pacman --noconfirm -S nvidia nvidia-utils nvidia-settings lib32-nvidia-utils nvidia-prime || {
-      echo "[NVIDIA] Package installation failed"; exit 1
-    }
-
-    echo "[NVIDIA] Blacklisting nouveau to avoid driver conflicts"
-    cat > /etc/modprobe.d/disable-nouveau.conf <<'DISABLE_NOUVEAU'
+# blacklist nouveau
+cat > /etc/modprobe.d/disable-nouveau.conf <<'DISABLE_NOUVEAU'
 # Disable nouveau for proprietary Nvidia driver
 blacklist nouveau
 options nouveau modeset=0
 DISABLE_NOUVEAU
 
-    echo "[NVIDIA] Ensuring nvidia DRM modeset option"
-    # prefer GRUB_CMDLINE_LINUX, fallback to _DEFAULT or create line
-    if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub 2>/dev/null; then
-      if ! grep -q 'nvidia_drm.modeset=1' /etc/default/grub; then
-        sed -i 's/^\(GRUB_CMDLINE_LINUX="\)\(.*\)"/\1nvidia_drm.modeset=1 \2"/' /etc/default/grub
-      fi
-    elif grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null; then
-      if ! grep -q 'nvidia_drm.modeset=1' /etc/default/grub; then
-        sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="\)\(.*\)"/\1nvidia_drm.modeset=1 \2"/' /etc/default/grub
-      fi
-    else
-      # No grub file pattern found, append a safe default
-      echo 'GRUB_CMDLINE_LINUX="nvidia_drm.modeset=1"' >> /etc/default/grub
-    fi
+# Ensure nvidia_drm.modeset=1 in grub
+if [[ -f /etc/default/grub ]]; then
+  if ! grep -q 'nvidia_drm.modeset=1' /etc/default/grub; then
+    sed -i '1s/^/GRUB_CMDLINE_LINUX="nvidia_drm.modeset=1" \n/' /etc/default/grub || true
+  fi
+fi
 
-    echo "[NVIDIA] Adding missing modules to /etc/mkinitcpio.conf (preserve existing)"
-    if [ -f /etc/mkinitcpio.conf ]; then
-      # read current MODULES line if present
-      cur_modules=$(awk -F= '/^MODULES=/{print substr($0, index($0,$2))}' /etc/mkinitcpio.conf || true)
-      # Normalize into array
-      need=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)
-      # If MODULES line missing, create it
-      if ! grep -q '^MODULES=' /etc/mkinitcpio.conf; then
-        # insert MODULES line near top (after HOOKS line if exists) — simplest: prepend
-        sed -i '1iMODULES=()' /etc/mkinitcpio.conf
-      fi
+if command -v mkinitcpio >/dev/null 2>&1; then
+  mkinitcpio -P || true
+fi
 
-      # Append missing modules to MODULES line (avoid duplicates)
-      for m in "${need[@]}"; do
-        if ! grep -q "^MODULES=.*\b$m\b" /etc/mkinitcpio.conf; then
-          sed -i "s/^MODULES=(/MODULES=( $m /" /etc/mkinitcpio.conf
-        fi
-      done
-    fi
-
-    echo "[NVIDIA] Regenerating initramfs for all kernels"
-    if command -v mkinitcpio >/dev/null 2>&1; then
-      mkinitcpio -P
-    else
-      echo "[NVIDIA] Warning: mkinitcpio not found inside chroot; skipping initramfs regeneration"
-    fi
-
-    echo "[NVIDIA] Creating modprobe options file for modeset (redundant with GRUB but helpful)"
-    cat > /etc/modprobe.d/nvidia-modeset.conf <<'NMOD'
+cat > /etc/modprobe.d/nvidia-modeset.conf <<'NMOD'
 options nvidia-drm modeset=1
 NMOD
 
-    echo "[NVIDIA] Update GRUB if present"
-    if command -v update-grub >/dev/null 2>&1; then
-      update-grub || echo "[NVIDIA] update-grub failed (non-fatal)"
-    elif command -v grub-mkconfig >/dev/null 2>&1; then
-      grub-mkconfig -o /boot/grub/grub.cfg || echo "[NVIDIA] grub-mkconfig failed (non-fatal)"
-    else
-      echo "[NVIDIA] No grub updater found inside chroot; skipping"
-    fi
+if command -v update-grub >/dev/null 2>&1; then
+  update-grub || true
+elif command -v grub-mkconfig >/dev/null 2>&1; then
+  grub-mkconfig -o /boot/grub/grub.cfg || true
+fi
 
-    echo "[NVIDIA] Done"
+echo "[NVIDIA] Done"
 CHROOT_EOF
 }
-    install_nvidia_drivers "A"
-    install_nvidia_drivers "B"
 
-    estat "Finalizing boot configurations"
-    finalize_part A
-    finalize_part B
-    estat "Finalizing EFI system partition"
-    cmd steamos-chroot --no-overlay --disk "$DISK" --partset A -- steamcl-install --flags restricted --force-extra-removable
+# NVMe sanitize helpers
+get_sanitize_progress() {
+  local status progress
+  status=$(nvme sanitize-log "${DISK}" 2>/dev/null | awk '/\(SSTAT\)/{print $NF}' || true)
+  if [[ -z "$status" ]]; then
+    return 2
   fi
+  # decode status heuristics from original script: return 0-ready,1-inprogress,2-unsupported
+  # (this keeps compatibility with the original)
+  if (( (0 + status) % 8 == 2 )); then
+    return 0
+  fi
+  progress=$(nvme sanitize-log "${DISK}" 2>/dev/null | awk '/\(SPROG\)/{print $NF}' || true)
+  if [[ -n "$progress" ]]; then
+    printf "sanitize progress: %d%%\n" $(( ( progress * 100 )/ 65535 ))
+    return 1
+  fi
+  return 2
 }
 
-# drop into the primary OS partset on the device
-#
-chroot_primary()
-{
-  partset=$( steamos-chroot --no-overlay --disk "$DISK" --partset "A" -- steamos-bootconf selected-image )
-
-  estat "Dropping into a chroot on the $partset partition set."
-  estat "You can make any needed changes here, and exit when done."
-
-  # FIXME etc overlay dir might not exist on a fresh install and this will fail
-
-  cmd steamos-chroot --disk "$DISK" --partset "$partset"
-}
-
-# return sanitize state (and echo the current percentage complete)
-# 0 : ready to sanitize
-# 1 : sanitize in progress (echo the current percentage)
-# 2 : drive does not support sanitize
-#
-get_sanitize_progress()
-{
-  status=$(nvme sanitize-log "${DISK}" | grep "(SSTAT)" | grep -oEi "(0x)?[[:xdigit:]]+$") || return 2
-  [[ $(( status % 8 )) -eq 2 ]] || return 0
-
-  progress=$(nvme sanitize-log "${DISK}" | grep "(SPROG)" | grep -oEi "(0x)?[[:xdigit:]]+$") || return 2
-  echo "sanitize progress: $(( ( progress * 100 )/ 65535 ))%"
-  return 1
-}
-
-# call nvme sanitize, blockwise, and wait for it to complete.
-#
-sanitize_all()
-{
-  sres=0
+sanitize_all() {
+  local sres=0
   get_sanitize_progress || sres=$?
   case $sres in
     0)
-      echo
-      echo "Warning!"
-      echo
-      echo "This action irrevocably clears *all* user data from ${DISK}"
-      echo "Pausing five seconds in case you didn't mean to do this..."
-      sleep 5
-      echo "Ok, let's go. Sanitizing ${DISK}:"
+      echo "This will irrevocably clear all data on ${DISK}"
+      if [[ $DRYRUN -eq 1 ]]; then
+        info "[DRYRUN] nvme sanitize -a 2 ${DISK}"
+        return 0
+      fi
       nvme sanitize -a 2 "${DISK}"
-      echo "Sanitize action started."
+      info "Sanitize action started."
       ;;
-    1) echo "An NVME sanitize action is already in progress."
+    1)
+      info "An NVME sanitize action is already in progress."
+      return 0
       ;;
-    2) # use NVME secure-format since this device does not appear to support sanitize
+    2)
+      info "Device doesn't support sanitize, falling back to secure format"
+      if [[ $DRYRUN -eq 1 ]]; then
+        info "[DRYRUN] nvme format ${DISK} -n 1 -s 1 -r"
+        return 0
+      fi
       nvme format "${DISK}" -n 1 -s 1 -r
       return 0
       ;;
-    *) echo "Unexpected result from sanitize-log"
-      return $sres
+    *)
+      die "Unexpected result from sanitize-log: $sres" 5
       ;;
   esac
 
-  while ! get_sanitize_progress ; do
+  # wait for progress to finish
+  while get_sanitize_progress; do
     sleep 5
   done
-
-  echo "... sanitize done."
+  info "Sanitize done."
 }
 
-# print quick list of targets
-#
-help()
-{
-  readvar HELPMSG << EOD
-This tool can be used to reinstall or repair your SteamOS installation
+# Main repair steps (keeps structure of original but safer)
+repair_steps() {
+  local writePartitionTable=${1:-0}
+  local writeOS=${2:-0}
+  local writeHome=${3:-0}
 
-Possible targets:
-    all : permanently destroy all data on the device, and (re)install SteamOS.
-    system : repair/reinstall SteamOS on the device's system partitions, preserving user data partitions.
-    home : reformat the devices /home and /var partitions, removing games and user data from the device.
-    chroot : chroot into to the primary SteamOS partition set.
-    sanitize : perform an NVME sanitize operation.
-EOD
-  emsg "$HELPMSG"
-  if [[ "$EUID" -ne 0 ]]; then
-    eerr "Please run as root."
-    exit 1
+  if [[ $writePartitionTable -eq 1 ]]; then
+    info "Writing known partition table to $DISK"
+    # Build final partition table (expand vars and substitute DISKPART token)
+    PART_TABLE_FINAL=$(printf "%s" "$PARTITION_TABLE" \
+    | sed "s|%%DISKPART%%|${DISK}${DISKPART_SEP}|g")
+
+
+    # write to temp file and run sfdisk (safer quoting and easier to debug)
+    tmpf=$(mktemp)
+    printf '%s\n' "$PART_TABLE_FINAL" > "$tmpf"
+
+    if [[ $DRYRUN -eq 1 ]]; then
+      info "[DRYRUN] sfdisk $DISK < $tmpf"
+    else
+      info "Applying partition table to $DISK (see $tmpf for content)"
+      sudo sfdisk "$DISK" < "$tmpf"
+    fi
+
+    rm -f "$tmpf"
+
+  elif [[ $writeOS -eq 1 || $writeHome -eq 1 ]]; then
+    # verify partitions
+    verifypart "$(diskpart 1)" vfat esp
+    verifypart "$(diskpart 2)" vfat efi-A
+    verifypart "$(diskpart 3)" vfat efi-B
+    verifypart "$(diskpart 6)" ext4 var-A
+    verifypart "$(diskpart 7)" ext4 var-B
+    verifypart "$(diskpart 8)" ext4 home
+  fi
+
+  if [[ $writeOS -eq 1 || $writeHome -eq 1 ]]; then
+    info "Formatting var partitions"
+    fmt_ext4 var "$(diskpart 6)"
+    fmt_ext4 var "$(diskpart 7)"
+  fi
+
+  if [[ $writeOS -eq 1 ]]; then
+    info "Formatting ESP/EFI partitions"
+    fmt_fat32 esp "$(diskpart 1)"
+    fmt_fat32 efi "$(diskpart 2)"
+    fmt_fat32 efi "$(diskpart 3)"
+  fi
+
+  if [[ $writeHome -eq 1 ]]; then
+    info "Formatting home partition"
+    run_cmd sudo mkfs.ext4 -F -O casefold -T huge -L home "$(diskpart 8)"
+    run_cmd sudo tune2fs -m 0 "$(diskpart 8)"
+  fi
+
+  if [[ $writeOS -eq 1 ]]; then
+    # Biostaging
+    local biostool="/usr/bin/jupiter-biosupdate"
+    if [[ -d "${VENDORED_BIOS_UPDATE:-}" ]]; then
+      biostool="${VENDORED_BIOS_UPDATE}/jupiter-biosupdate"
+      export JUPITER_BIOS_DIR="$VENDORED_BIOS_UPDATE"
+    fi
+
+    fix_esp() {
+      safe_umount /esp
+      safe_umount /boot/efi
+    }
+    register_onexit fix_esp
+
+    info "Mounting ESP/EFI to stage BIOS"
+    run_cmd sudo mkdir -p /esp /boot/efi
+    safe_mount "$(diskpart 1)" /esp
+    safe_mount "$(diskpart 2)" /boot/efi
+
+    if [[ ${FORCEBIOS:-0} -eq 1 ]]; then
+      run_cmd sudo "$biostool" --force || run_cmd sudo "$biostool"
+    else
+      run_cmd sudo "$biostool" || warn "Bios tool failed (non-fatal)"
+    fi
+
+    fix_esp
+  fi
+
+  if [[ $writeOS -eq 1 ]]; then
+    info "Controller firmware update (if applicable)"
+    local controller_tool="/usr/bin/jupiter-controller-update"
+    if [[ -d "${VENDORED_CONTROLLER_UPDATE:-}" ]]; then
+      controller_tool="${VENDORED_CONTROLLER_UPDATE}/jupiter-controller-update"
+      export JUPITER_CONTROLLER_UPDATE_FIRMWARE_DIR="$VENDORED_CONTROLLER_UPDATE"
+    fi
+    # allow failure but try to run
+    run_cmd sudo env JUPITER_CONTROLLER_UPDATE_IN_OOBE=1 "$controller_tool" || warn "controller update failed (non-fatal)"
+  fi
+
+  if [[ $writeOS -eq 1 ]]; then
+    local rootdevice
+    rootdevice="$(findmnt -n -o source / || true)"
+    [[ -n "$rootdevice" && -e "$rootdevice" ]] || die "Could not find installer root device -- abort."
+
+    # Freeze and ensure unfreeze on exit
+    unfreeze() { if mountpoint -q /; then run_cmd sudo fsfreeze -u / || true; fi; }
+    register_onexit unfreeze
+    run_cmd sudo fsfreeze -f /
+
+    info "Imaging OS partition A"
+    imageroot "$rootdevice" "$(diskpart 4)"
+    info "Imaging OS partition B"
+    imageroot "$rootdevice" "$(diskpart 5)"
+
+    echo ":: Enabling devmode so pacman can write to the rootfs"
+    sudo steamos-devmode enable || true
+    
+    # install nvidia drivers in both partsets A and B
+    install_nvidia_drivers "A"
+    install_nvidia_drivers "B"
+
+    sudo steamos-devmode disable || true
+
+    info "Finalizing boot configurations and EFI content"
+    finalize_part A
+    finalize_part B
+
+    run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset A -- steamcl-install --flags restricted --force-extra-removable || warn "steamcl-install returned non-zero"
   fi
 }
 
-[[ "$EUID" -ne 0 ]] && help
+# CLI parse (minimal)
+if [[ $# -lt 1 ]]; then usage; fi
 
-writePartitionTable=0
-writeOS=0
-writeHome=0
+# parse options before target
+TARGET=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --disk) DISK="${2:-}"; shift 2;;
+    --no-prompt) PROMPT=0; shift;;
+    --dry-run) DRYRUN=1; shift;;
+    --force-bios) FORCEBIOS=1; shift;;
+    --poweroff) POWEROFF=1; shift;;
+    all|system|home|chroot|sanitize)
+      TARGET="$1"; shift;;
+    -*)
+      error "Unknown option: $1"; usage;;
+    *)
+      TARGET="$1"; shift;;
+  esac
+done
 
-case "${1-help}" in
-all)
-  prompt_step "Wipe Device & Install SteamOS" "This action will wipe and (re)install SteamOS on this device.\nThis will permanently destroy all data on your device.\n\nThis cannot be undone.\n\nChoose Proceed only if you wish to wipe and reinstall this device."
-  writePartitionTable=1
-  writeOS=1
-  writeHome=1
-  sanitize_all
-  repair_steps
-  prompt_reboot "Reimaging complete."
-  ;;
-system)
-  prompt_step "Repair SteamOS" "This action will repair the SteamOS installation on the device, while attempting to preserve your games and personal content.\nSystem customizations may be lost.\n\nChoose Proceed to reinstall SteamOS on your device."
-  writeOS=1
-  repair_steps
-  prompt_reboot "SteamOS reinstall complete."
-  ;;
-home)
-  prompt_step "Delete local user data" "This action will reformat the home partitions on your device.\nThis will destroy downloaded games and all personal content, including system configuration.\n\nThis action cannot be undone.\n\nChoose Proceed to reformat all user home partitions."
-  writeHome=1
-  repair_steps
-  prompt_reboot "User partitions have been reformatted."
-  ;;
-chroot)
-  chroot_primary
-  ;;
-sanitize)
-  prompt_step "Clear and sanitize NVME disk" "This action will kick off an NVME sanitize on the primary drive, irrevocably deleting all user data.\n\nThis action cannot be undone.\n\nChoose Proceed only if you want to remove all data from the current device's primary drive."
-  sanitize_all
-  ;;
-*)
-  help
-  ;;
-esac 
+# --- Auto detect disk (NVMe → SATA fallback, unless --disk was given) ---
 
+AUTO_DISK=""
+USER_DISK_SET=0
+
+# Check if user provided --disk
+if [[ "$DISK" != "$DISK_DEFAULT" ]]; then
+  USER_DISK_SET=1
+fi
+
+if [[ $USER_DISK_SET -eq 0 ]]; then
+  # Try NVMe first
+  if ls /dev/nvme0n1 >/dev/null 2>&1; then
+    AUTO_DISK="/dev/nvme0n1"
+    info "NVMe detectado automaticamente: $AUTO_DISK"
+  else
+    # fallback SATA /dev/sdX
+    SATA_FOUND=$(ls /dev/sd[a-z] 2>/dev/null | head -n 1 || true)
+    if [[ -n "$SATA_FOUND" ]]; then
+      AUTO_DISK="$SATA_FOUND"
+      info "NVMe não encontrado. Usando disco SATA: $AUTO_DISK"
+    else
+      die "Nenhum disco NVMe ou SATA encontrado! Abortando." 9
+    fi
+  fi
+
+  DISK="$AUTO_DISK"
+else
+  info "Usando disco informado pelo usuário via --disk: $DISK"
+fi
+
+
+# validate disk exists
+if [[ ! -b "$DISK" && ! -e "$DISK" ]]; then
+  die "Disk $DISK does not exist. Adjust --disk parameter." 6
+fi
+
+require_cmds
+
+# Commands for targets
+case "${TARGET-}" in
+  all)
+    prompt_step "Wipe Device & Install SteamOS" "This action will wipe and (re)install SteamOS on this device. This will permanently destroy all data on your device. Choose Proceed only if you wish to wipe and reinstall this device."
+    repair_steps 1 1 1
+    sanitize_all
+    if [[ $POWEROFF -eq 1 ]]; then
+      run_cmd systemctl poweroff
+    else
+      run_cmd systemctl reboot
+    fi
+    ;;
+  system)
+    prompt_step "Repair SteamOS" "This action will repair the SteamOS installation on the device, while attempting to preserve your games and personal content."
+    repair_steps 0 1 0
+    if [[ $POWEROFF -eq 1 ]]; then
+      run_cmd systemctl poweroff
+    else
+      run_cmd systemctl reboot
+    fi
+    ;;
+  home)
+    prompt_step "Delete local user data" "This action will reformat the home partitions on your device. This will destroy downloaded games and all personal content."
+    repair_steps 0 0 1
+    if [[ $POWEROFF -eq 1 ]]; then
+      run_cmd systemctl poweroff
+    else
+      run_cmd systemctl reboot
+    fi
+    ;;
+  chroot)
+    info "Opening steamos-chroot into primary partition set"
+    run_cmd steamos-chroot --disk "$DISK" --partset "A"
+    ;;
+  sanitize)
+    prompt_step "Clear and sanitize NVME disk" "This action will kick off an NVME sanitize on the primary drive, irrevocably deleting all user data."
+    sanitize_all
+    ;;
+  *)
+    usage
+    ;;
+esac
