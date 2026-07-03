@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n \"/run/media/nobara-user/364AE3374AE2F293/GIT/SteamOS/REPAIRDEVICE_NEW.sh\")",
+      "Bash(command -v shellcheck)",
+      "Bash(shellcheck -S warning \"/run/media/nobara-user/364AE3374AE2F293/GIT/SteamOS/REPAIRDEVICE_NEW.sh\")",
+      "Bash(git -C \"/run/media/nobara-user/364AE3374AE2F293/GIT/SteamOS\" remote -v)",
+      "Bash(git -C \"/run/media/nobara-user/364AE3374AE2F293/GIT/SteamOS\" branch --show-current)",
+      "Bash(bash -n REPAIRDEVICE_NEW.sh)",
+      "Bash(bash -n bootstrap.sh)",
+      "Bash(bash -n postinstall/nvidia.sh)",
+      "Bash(chmod +x bootstrap.sh postinstall/nvidia.sh)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(command -v gh)",
+      "Bash(gh auth *)",
+      "Bash(git config *)",
+      "Bash(git -C \"/run/media/nobara-user/364AE3374AE2F293/GIT/SteamOS\" log -1 --format=\"%h %an <%ae>\")"
+    ]
+  }
+}
