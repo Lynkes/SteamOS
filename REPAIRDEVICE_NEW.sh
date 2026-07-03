@@ -2,55 +2,25 @@
 # -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 2; -*-
 # vim: et sts=2 sw=2
 #
-# A collection of functions to repair and modify a Steam Deck installation.
+# A collection of functions to repair and modify a Steam Deck installation,
+# generalized to target any disk (NVMe / SATA / eMMC / virtio) and any PC.
 # This makes a number of assumptions about the target device and will be
 # destructive if you have modified the expected partition layout.
+#
+# Environment overrides:
+#   DISK=/dev/sdX     skip the disk picker and use this disk
+#   NOPROMPT=1        skip confirmation dialogs
+#   POWEROFF=1        power off instead of reboot when done
+#   NVIDIA=0          never install NVIDIA drivers / NVIDIA=1 force install
 #
 
 set -eu
 
-die() { echo >&2 "!! $*"; exit 1; }
 readvar() { IFS= read -r -d '' "$1" || true; }
-select_disk() {
-    # Exemplo de uso:
-        #select_disk
-        #echo "Selected disk: /dev/$DISK"
-        #echo "Partition suffix: $DISK_SUFFIX"
-    # Funções internas para listar discos
-    list_nvme_disks() { ls /sys/block | grep '^nvme' 2>/dev/null; }
-    list_sata_disks() { ls /sys/block | grep '^sd' 2>/dev/null; }
 
-    # Passo 1: escolher tipo de dispositivo
-    local device_type
-    device_type=$(zenity --list --title="Select Device Type" \
-                         --column="Type" "NVMe" "SATA" \
-                         --height=200 --width=250)
-    [[ -n "$device_type" ]] || { echo "No device type selected. Exiting."; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POSTINSTALL_DIR="$SCRIPT_DIR/postinstall"
 
-    # Passo 2: listar discos do tipo escolhido
-    local disks=()
-    if [[ "$device_type" == "NVMe" ]]; then
-        disks=($(list_nvme_disks))
-    elif [[ "$device_type" == "SATA" ]]; then
-        disks=($(list_sata_disks))
-    fi
-
-    [[ ${#disks[@]} -gt 0 ]] || { echo "No disks of type $device_type found. Exiting."; exit 1; }
-
-    # Passo 3: selecionar o disco
-    local selected_disk
-    selected_disk=$(zenity --list --title="Select Disk" --column="Disk" "${disks[@]}" \
-                           --height=300 --width=300)
-    [[ -n "$selected_disk" ]] || { echo "No disk selected. Exiting."; exit 1; }
-
-    # Passo 4: definir variáveis globais
-    DISK="/dev/$selected_disk"
-    if [[ "$device_type" == "NVMe" ]]; then
-        DISK_SUFFIX="p"
-    else
-        DISK_SUFFIX=""
-    fi
-}
 DOPARTVERIFY=1
 
 # If this exists, use the jupiter-biosupdate binary from this directory, and set JUPITER_BIOS_DIR to this directory when
@@ -75,31 +45,11 @@ PART_SIZE_HOME="100" # For the stub .img file we're making this can be tiny, OS 
 DISK_SIZE=$(( 2 + PART_SIZE_HOME + PART_SIZE_ESP + 2 * ( PART_SIZE_EFI + PART_SIZE_ROOT + PART_SIZE_VAR ) ))
 # Alignment: Using general sizes like MiB and no explicit start offset points causes sfdisk to align to MiB boundaries
 #            by default (e.g. first partition will start at 1MiB). See `man sfdisk`.
+#
+# Sector size: GPT tables aren't portable between logical sector sizes, but since we write the table with sfdisk
+#              directly against the target disk (instead of dd'ing a prebuilt image), sfdisk translates the MiB-based
+#              sizes to whatever sector size the target uses (512e or 4Kn) - one less portability problem.
 
-# Sector size: Most physical SSD/NVMe/etc use logical 512 sectors*. GPT partition tables aren't portable between varying
-#              sector sizes, so this .img cannot be used directly on a 4k-logical-sector device (a quick search suggests
-#              this is most likely with certain VM/cloud/network disks)
-#
-
-#              Since we use 1MiB alignment, it should be possible to fixup this partition table for other sector sizes
-#              without physically moving any partitions at imaging time:
-#
-#                  dd if=output.img of=/target/disk
-#
-#                  # sfdisk will default to 512 for a local file, dumping the table correctly, then translate it to the
-#                  # target device's sector size upon re-writing:
-#
-#                  sfdisk -d < output.img | sfdisk /target/disk
-#
-#              Alternatively, use `losetup --sector-size` to remount the image at a different size, and use the above
-#              steps to regenerate the table.  If this comes up often in practice we could output a "partitions4096.gpt"
-#              style file alongside the disk image that could be `dd`'d on top for weird VM setups.
-#
-#              *Note: logical sectors != physical sectors != optimal I/O alignment.  Logical sectors being the unit the
-#               OS addresses the disk by, and what GPT tables use as their basic written-to-disk unit.  Most everything
-#               is 512 or (rarely) 4096.
-
-TARGET_SECTOR_SIZE=512 # Passed to `losetup` to emulate, affects the sector-offsets sfdisk ends up writing.
 readvar PARTITION_TABLE <<END_PARTITION_TABLE
   label: gpt
   %%DISKPART%%1: name="esp",      size=         ${PART_SIZE_ESP}MiB,  type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
@@ -151,12 +101,14 @@ showcmd_unquoted() { echo >&2 "$(sh_c 30 1)+$(sh_c) $*"; }
 cmd() { showcmd "$@"; "$@"; }
 
 # Helper to format
-fmt_ext4()  { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd sudo mkfs.ext4 -F -L "$1" "$2"; }
-fmt_fat32() { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd sudo mkfs.vfat -n"$1" "$2"; }
+fmt_ext4()  { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.ext4 -F -L "$1" "$2"; }
+fmt_fat32() { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.vfat -n"$1" "$2"; }
 
 ##
-## Prompt mechanics - currently using Zenity
+## Prompt mechanics - Zenity when a display is available, terminal fallback otherwise
 ##
+
+have_gui() { command -v zenity >/dev/null 2>&1 && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; }
 
 # Give the user a choice between Proceed, or Cancel (which exits this script)
 #  $1 Title
@@ -171,8 +123,16 @@ prompt_step()
     echo -e "$msg"
     return 0
   fi
-  zenity --title "$title" --question --ok-label "Proceed" --cancel-label "Cancel" --no-wrap --text "$msg"
-  [[ $? = 0 ]] || exit 1
+  if have_gui; then
+    zenity --title "$title" --question --ok-label "Proceed" --cancel-label "Cancel" --no-wrap --text "$msg" || exit 1
+  else
+    echo >&2
+    emsg "== $title =="
+    echo -e >&2 "$msg"
+    local ans
+    read -r -p "Type 'yes' to proceed, anything else cancels: " ans
+    [[ ${ans,,} = yes ]] || exit 1
+  fi
 }
 
 prompt_reboot()
@@ -181,13 +141,136 @@ prompt_reboot()
   local mode="reboot"
   [[ ${POWEROFF:-} ]] && mode="shutdown"
 
-  prompt_step "Action Successful" "${msg}\n\nChoose Proceed to $mode the Steam Deck now, or Cancel to stay in the repair image." "${REBOOTPROMPT:-}"
-  [[ $? = 0 ]] || exit 1
+  prompt_step "Action Successful" "${msg}\n\nChoose Proceed to $mode the device now, or Cancel to stay in the repair image." "${REBOOTPROMPT:-}"
   if [[ ${POWEROFF:-} ]]; then
     cmd systemctl poweroff
   else
     cmd systemctl reboot
   fi
+}
+
+##
+## Disk selection
+##
+
+# Disco (pai) que hospeda o rootfs do instalador - nunca pode ser alvo da instalação
+installer_disk()
+{
+  local rootsrc
+  rootsrc="$(findmnt -n -o source / 2>/dev/null)" || return 0
+  [[ -b $rootsrc ]] || return 0
+  lsblk -n -o PKNAME "$rootsrc" 2>/dev/null | head -n1
+}
+
+# Sufixo de partição: dispositivos cujo nome termina em dígito (nvme0n1, mmcblk0)
+# usam "p" antes do número da partição; os demais (sda, vda) não.
+set_disk_suffix()
+{
+  case "$DISK" in
+    *[0-9]) DISK_SUFFIX="p" ;;
+    *)      DISK_SUFFIX=""  ;;
+  esac
+}
+
+# Lista todos os discos utilizáveis e deixa o usuário escolher o alvo.
+# Define DISK e DISK_SUFFIX. Respeita DISK=/dev/xxx vindo do ambiente.
+select_disk()
+{
+  if [[ -n ${DISK:-} ]]; then
+    [[ -b $DISK ]] || die "DISK=$DISK is not a block device"
+    set_disk_suffix
+    einfo "Using preselected disk $DISK"
+    return 0
+  fi
+
+  local skip
+  skip="$(installer_disk)"
+
+  local -a names=() zargs=()
+  local name info
+  for dev in /sys/block/*; do
+    name="${dev##*/}"
+    case "$name" in
+      nvme*n[0-9]|nvme*n[0-9][0-9]|sd*|mmcblk[0-9]*|vd*) ;;
+      *) continue ;;
+    esac
+    [[ $name != "${skip:-}" ]] || continue
+    [[ -b "/dev/$name" ]] || continue
+    info="$(lsblk -dn -o SIZE,TRAN,MODEL "/dev/$name" 2>/dev/null | tr -s ' ' || true)"
+    names+=("$name")
+    zargs+=("$name" "${info:-?}")
+  done
+
+  [[ ${#names[@]} -gt 0 ]] || die "No candidate target disks found (installer disk is excluded)."
+
+  local selected=""
+  if have_gui; then
+    selected=$(zenity --list --title="Select Target Disk" \
+                      --text="All data on the selected disk will be affected.\nInstaller disk (${skip:-n/a}) is hidden." \
+                      --column="Disk" --column="Size / Bus / Model" "${zargs[@]}" \
+                      --height=350 --width=520) || true
+  else
+    emsg "Available target disks (installer disk ${skip:-n/a} excluded):"
+    local i
+    for i in "${!names[@]}"; do
+      echo >&2 "  $((i+1))) ${names[$i]}  ($(lsblk -dn -o SIZE,TRAN,MODEL "/dev/${names[$i]}" 2>/dev/null | tr -s ' '))"
+    done
+    local choice
+    read -r -p "Select disk [1-${#names[@]}]: " choice
+    [[ $choice =~ ^[0-9]+$ && $choice -ge 1 && $choice -le ${#names[@]} ]] || die "Invalid selection."
+    selected="${names[$((choice-1))]}"
+  fi
+
+  [[ -n $selected ]] || die "No disk selected."
+  DISK="/dev/$selected"
+  set_disk_suffix
+  estat "Selected target disk: $DISK (partition prefix: '${DISK_SUFFIX}')"
+}
+
+# Garante que o disco alvo comporta o layout
+check_disk_size()
+{
+  local bytes needed
+  bytes="$(blockdev --getsize64 "$DISK")"
+  needed=$(( DISK_SIZE * 1024 * 1024 ))
+  if (( bytes < needed )); then
+    die "Disk $DISK is too small: $(( bytes / 1024 / 1024 ))MiB available, ${DISK_SIZE}MiB required."
+  fi
+}
+
+##
+## Hardware detection
+##
+
+is_steam_deck()
+{
+  local product
+  product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  [[ $product = Jupiter* || $product = Galileo* ]]
+}
+
+##
+## Post-install hooks
+##
+
+# Run every script in postinstall/ against a partset. Each hook decides for
+# itself whether it applies (e.g. nvidia.sh checks lspci) and receives:
+#   DISK, DISK_SUFFIX, PARTSET, TARGET_ROOT_DEV, PAYLOAD_DIR
+#   $1 partset name
+#   $2 rootfs device of that partset
+run_postinstall()
+{
+  local partset="$1" rootdev="$2" hook
+  [[ -d $POSTINSTALL_DIR ]] || return 0
+  for hook in "$POSTINSTALL_DIR"/*.sh; do
+    [[ -e $hook ]] || continue
+    estat "Post-install hook: $(basename "$hook") (partset $partset)"
+    if ! DISK="$DISK" DISK_SUFFIX="$DISK_SUFFIX" PARTSET="$partset" \
+         TARGET_ROOT_DEV="$rootdev" PAYLOAD_DIR="$SCRIPT_DIR" \
+         bash "$hook"; then
+      ewarn "Hook $(basename "$hook") failed on partset $partset - continuing"
+    fi
+  done
 }
 
 ##
@@ -209,7 +292,7 @@ verifypart()
     sleep infinity ; exit 1
   fi
 
-  if [[ ! $PARTLABEL = $3 ]] ; then 
+  if [[ ! $PARTLABEL = $3 ]] ; then
     eerr "Device $1 has label $PARTLABEL but expected $3 - cannot proceed. You may try full recovery."
     sleep infinity ; exit 2
   fi
@@ -234,14 +317,14 @@ imageroot()
 finalize_part()
 {
   estat "Finalizing install part $1"
-  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- mkdir /efi/SteamOS
+  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- mkdir -p /efi/SteamOS
   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- mkdir -p /esp/SteamOS/conf
   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- steamos-partsets /efi/SteamOS/partsets
   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- steamos-bootconf create --image "$1" --conf-dir /esp/SteamOS/conf --efi-dir /efi --set title "$1"
   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- grub-mkimage
   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- update-grub
   # Galileo OS should have this embedded
-   cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- bash -c "mkdir -pv /var/lib && echo main > /var/lib/steamos-branch"
+  cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$1" -- bash -c "mkdir -pv /var/lib && echo main > /var/lib/steamos-branch"
 }
 
 ##
@@ -256,20 +339,17 @@ exithandler() {
 }
 trap exithandler EXIT
 
-# Check existence of target disk
-#if [[ ! -e "$DISK" ]]; then
-#  eerr "$DISK does not exist -- no nvme drive detected?"
-#  sleep infinity
-#  exit 1
-#fi
-
 # Reinstall a fresh SteamOS copy.
 #
 repair_steps(){
-    
+
   if [[ $writePartitionTable = 1 ]]; then
+    check_disk_size
     estat "Write known partition table"
-    echo "$PARTITION_TABLE" | sfdisk "$DISK"
+    echo "$PARTITION_TABLE" | sed "s|%%DISKPART%%|${DISK}${DISK_SUFFIX}|g" | cmd sfdisk "$DISK"
+    # re-read partitions before formatting them
+    cmd partprobe "$DISK" || cmd blockdev --rereadpt "$DISK" || true
+    cmd udevadm settle || true
 
   elif [[ $writeOS = 1 || $writeHome = 1 ]]; then
 
@@ -303,13 +383,14 @@ repair_steps(){
 
   if [[ $writeHome = 1 ]]; then
     estat "Creating home partition..."
-    cmd sudo mkfs.ext4 -F -O casefold -T huge -L home "$(diskpart $FS_HOME)"
+    cmd mkfs.ext4 -F -O casefold -T huge -L home "$(diskpart $FS_HOME)"
     estat "Remove the reserved blocks on the home partition..."
-    tune2fs -m 0 "$(diskpart $FS_HOME)"
+    cmd tune2fs -m 0 "$(diskpart $FS_HOME)"
   fi
 
   # Stage a BIOS update for next reboot if updating OS. OOBE images like this one don't auto-update the bios on boot.
-  if [[ $writeOS = 1 ]]; then
+  # Only meaningful on real Steam Deck hardware (Jupiter/Galileo) - skipped everywhere else.
+  if [[ $writeOS = 1 ]] && is_steam_deck; then
     estat "Staging a BIOS update for next boot if necessary"
     # If we included a VENDORED_BIOS_UPDATE directory above, use the newer payload there and point JUPITER_BIOS_DIR to
     # it.  Directory should contain both a newer tool and newer firmware.
@@ -319,31 +400,37 @@ repair_steps(){
       export JUPITER_BIOS_DIR="$VENDORED_BIOS_UPDATE"
     fi
 
-    # This is cursed, but, we want to stage the capsule in the onboard nvme, which we are booting next
-    fix_esp() {
-      if [[ -n $mounted_esp ]]; then
-        cmd umount -l /esp
-        cmd umount -l /boot/efi
-        mounted_esp=
+    if [[ -x $biostool ]]; then
+      # This is cursed, but, we want to stage the capsule in the onboard nvme, which we are booting next
+      fix_esp() {
+        if [[ -n $mounted_esp ]]; then
+          cmd umount -l /esp
+          cmd umount -l /boot/efi
+          mounted_esp=
+        fi
+      }
+      onexit+=(fix_esp)
+      einfo "Mounting new ESP/EFI on /esp /boot/efi for BIOS staging"
+      cmd mount "$(diskpart $FS_ESP)" /esp
+      cmd mount "$(diskpart $FS_EFI_A)" /boot/efi
+      mounted_esp=1
+
+      if [[ ${FORCEBIOS:-} ]]; then
+        "$biostool" --force || "$biostool"
+      else
+        "$biostool"
       fi
-    }
-    onexit+=(fix_esp)
-    einfo "Mounting new ESP/EFI on /esp /boot/efi for BIOS staging"
-    cmd mount "$(diskpart $FS_ESP)" /esp
-    cmd mount "$(diskpart $FS_EFI_A)" /boot/efi
-    mounted_esp=1
 
-    if [[ ${FORCEBIOS:-} ]]; then
-      "$biostool" --force || "$biostool"
+      fix_esp
     else
-      "$biostool"
+      ewarn "jupiter-biosupdate not found - skipping BIOS staging"
     fi
-
-    fix_esp
+  elif [[ $writeOS = 1 ]]; then
+    einfo "Not a Steam Deck - skipping BIOS staging"
   fi
 
   # Perform a controller update if updating OS.  OOBE images like this one don't auto-update controllers on boot.
-  if [[ $writeOS = 1 ]]; then
+  if [[ $writeOS = 1 ]] && is_steam_deck; then
     estat "Updating controller firmware if necessary"
     controller_tool="/usr/bin/jupiter-controller-update"
     # If we included a VENDORED_CONTROLLER_UPDATE directory above, use the newer payload and point
@@ -367,92 +454,37 @@ repair_steps(){
 
     # Freeze our rootfs
     estat "Freezing rootfs"
-    unfreeze() { fsfreeze -u /; }
+    rootfs_frozen=
+    unfreeze() {
+      if [[ -n ${rootfs_frozen:-} ]]; then
+        fsfreeze -u / || true
+        rootfs_frozen=
+      fi
+    }
     onexit+=(unfreeze)
     cmd fsfreeze -f /
+    rootfs_frozen=1
 
     estat "Imaging OS partition A"
     imageroot "$rootdevice" "$(diskpart $FS_ROOT_A)"
-  
+
     estat "Imaging OS partition B"
     imageroot "$rootdevice" "$(diskpart $FS_ROOT_B)"
-    # install nvidia drivers in both partsets A and B
-    has_rtx_gpu
-  
+
+    # unfreeze before touching the network / package manager
+    estat "Unfreezing rootfs"
+    unfreeze
+
+    # run post-install hooks (driver installs etc.) on both partsets
+    run_postinstall A "$(diskpart $FS_ROOT_A)"
+    run_postinstall B "$(diskpart $FS_ROOT_B)"
+
     estat "Finalizing boot configurations"
     finalize_part A
     finalize_part B
     estat "Finalizing EFI system partition"
     cmd steamos-chroot --no-overlay --disk "$DISK" --partset A -- steamcl-install --flags restricted --force-extra-removable
   fi
-}
-
-# Verifica se existe alguma GPU NVIDIA RTX
-has_rtx_gpu() {
-    # lspci lista GPUs; grep procura NVIDIA; egrep procura RTX
-    if lspci | grep -i nvidia | grep -Eiq 'rtx'; then
-        echo ":: Enabling devmode so pacman can write to the rootfs"
-        sudo steamos-devmode enable || true
-        install_nvidia_drivers "A"
-        install_nvidia_drivers "B"
-        sudo steamos-devmode disable || true
-        return 0  # RTX detectada
-    else
-        return 1  # nenhuma RTX detectada
-    fi
-}
-
-install_nvidia_drivers() {
-  # install nvidia drivers inside a partset (kept much of original logic)
-  local part="$1"
-  info "Installing Nvidia drivers inside partset $part"
-  run_cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$part" -- bash -e <<'CHROOT_EOF' || true
-set -euo pipefail
-
-echo "[NVIDIA] Attempting to initialize keyring and refresh packages"
-
-if command -v pacman-key >/dev/null 2>&1; then
-  pacman-key --init 2>/dev/null || true
-  pacman-key --populate archlinux 2>/dev/null || true
-fi
-
-# --- BLOCO SUBSTITUÍDO (pacman) ---
-if command -v pacman >/dev/null 2>&1; then
-  pacman -Sy --noconfirm || true
-  pacman -S --noconfirm nvidia-dkms nvidia-utils linux-headers lib32-nvidia-utils || true
-fi
-# --- FIM DO BLOCO ---
-
-# blacklist nouveau
-cat > /etc/modprobe.d/disable-nouveau.conf <<'DISABLE_NOUVEAU'
-# Disable nouveau for proprietary Nvidia driver
-blacklist nouveau
-options nouveau modeset=0
-DISABLE_NOUVEAU
-
-# Ensure nvidia_drm.modeset=1 in grub
-if [[ -f /etc/default/grub ]]; then
-  if ! grep -q 'nvidia_drm.modeset=1' /etc/default/grub; then
-    sed -i '1s/^/GRUB_CMDLINE_LINUX="nvidia_drm.modeset=1" \n/' /etc/default/grub || true
-  fi
-fi
-
-if command -v mkinitcpio >/dev/null 2>&1; then
-  mkinitcpio -P || true
-fi
-
-cat > /etc/modprobe.d/nvidia-modeset.conf <<'NMOD'
-options nvidia-drm modeset=1
-NMOD
-
-if command -v update-grub >/dev/null 2>&1; then
-  update-grub || true
-elif command -v grub-mkconfig >/dev/null 2>&1; then
-  grub-mkconfig -o /boot/grub/grub.cfg || true
-fi
-
-echo "[NVIDIA] Done"
-CHROOT_EOF
 }
 
 # drop into the primary OS partset on the Deck
@@ -475,14 +507,6 @@ chroot_primary()
 # 2 : drive does not support sanitize
 #
 get_sanitize_progress() {
-  # return sanitize state (and echo the current percentage complete)
-    # 0 : ready to sanitize
-    # 1 : sanitize in progress (echo the current percentage)
-    # 2 : drive does not support sanitize
-  #CALL
-    #get_sanitize_progress "/dev/nvme0n1"
-    #get_sanitize_progress "/dev/sda"
-  # Verifica se o dispositivo existe
   if [ ! -b "$DISK" ]; then
     echo "Error: $DISK is not a block device."
     return 2
@@ -502,10 +526,9 @@ get_sanitize_progress() {
   progress=$(nvme sanitize-log "$DISK" 2>/dev/null | grep "(SPROG)" | grep -oEi "(0x)?[[:xdigit:]]+$") || return 2
   echo "sanitize progress: $(( (progress * 100) / 65535 ))%"
   return 1
-
 }
 
-# call nvme sanitize, blockwise, and wait for it to complete.
+# call nvme sanitize (NVMe) or secure-erase/blkdiscard (SATA), and wait for completion.
 #
 sanitize_all() {
   if [ ! -b "$DISK" ]; then
@@ -519,7 +542,7 @@ sanitize_all() {
     echo "Disk type: NVMe"
     # Checa progresso atual
     local sres=0
-    get_sanitize_progress "$DISK" || sres=$?
+    get_sanitize_progress || sres=$?
 
     case $sres in
       0)
@@ -531,11 +554,11 @@ sanitize_all() {
         ;;
       1)
         echo "Sanitize already in progress for $DISK"
-        return 0
         ;;
       2)
         echo "NVMe sanitize not supported, trying secure format..."
         nvme format "$DISK" -n 1 -s 1 -r || echo "NVMe secure format failed!"
+        return 0
         ;;
       *)
         echo "Unexpected sanitize-log result for $DISK"
@@ -544,33 +567,34 @@ sanitize_all() {
     esac
 
     # Espera término
-    while ! get_sanitize_progress "$DISK"; do
+    while ! get_sanitize_progress; do
       sleep 5
     done
     echo "... NVMe sanitize done."
 
   else
     echo "Disk type: SATA/SSD"
-    # Primeiro tenta hdparm secure erase se suportado
-    if command -v hdparm >/dev/null 2>&1; then
-      # Verifica se suporta security erase
-      if hdparm -I "$DISK" | grep -q 'supported'; then
-        echo "Using hdparm security-erase..."
-        # Desbloqueia se necessário
-        sudo hdparm --user-master u --security-unlock NULL "$DISK" || true
-        sudo hdparm --user-master u --security-erase NULL "$DISK"
+    # Primeiro tenta hdparm secure erase, se suportado e não congelado pelo BIOS
+    if command -v hdparm >/dev/null 2>&1 \
+       && hdparm -I "$DISK" 2>/dev/null | grep -qE '^[[:space:]]+supported$' \
+       && hdparm -I "$DISK" 2>/dev/null | grep -qE '^[[:space:]]+not[[:space:]]+frozen$'; then
+      echo "Using hdparm security-erase..."
+      hdparm --user-master u --security-set-pass NULL "$DISK" || true
+      hdparm --user-master u --security-erase NULL "$DISK" && {
         echo "... SATA secure erase done."
         return 0
-      fi
+      }
+      echo "hdparm secure erase failed, falling back..."
     fi
 
-    # Fallback: destrói todo o conteúdo com blkdiscard (rápido) ou dd (seguro)
-    if command -v blkdiscard >/dev/null 2>&1; then
-      echo "Using blkdiscard to wipe $DISK..."
-      sudo blkdiscard "$DISK" -f
+    # Fallback: destrói todo o conteúdo com blkdiscard (rápido, só SSD) ou dd (lento)
+    if blkdiscard -f "$DISK" 2>/dev/null; then
+      echo "... blkdiscard wipe done."
     else
       echo "Using dd to zero-fill $DISK (this may take a long time)..."
-      sudo dd if=/dev/zero of="$DISK" bs=128M status=progress || true
+      dd if=/dev/zero of="$DISK" bs=128M status=progress oflag=direct || true
+      sync
+      echo "... zero-fill done."
     fi
     echo "... SATA/SSD sanitize done."
   fi
@@ -582,14 +606,20 @@ sanitize_all() {
 help()
 {
   readvar HELPMSG << EOD
-This tool can be used to reinstall or repair your SteamOS installation on a Steam Deck.
+This tool reinstalls or repairs a SteamOS installation on a chosen disk
+(Steam Deck NVMe, SATA SSD, eMMC or virtual disk).
 
 Possible targets:
-    all : permanently destroy all data on your Steam Deck, and reinstall SteamOS.
-    system : reinstall SteamOS on the Steam Deck system partitions.
-    home : remove games and personalization from the Steam Deck.
+    menu : interactive menu with all the actions below.
+    all : permanently destroy all data on the selected disk, and reinstall SteamOS.
+    system : reinstall SteamOS on the system partitions of the selected disk.
+    home : remove games and personalization from the selected disk.
     chroot : chroot to the primary SteamOS partition set.
-    sanitize : perform an NVME sanitize operation.
+    sanitize : perform a sanitize/secure-erase operation on the selected disk.
+
+Environment:
+    DISK=/dev/sdX  preselect target disk    NOPROMPT=1  skip confirmations
+    NVIDIA=0|1     force-skip/force NVIDIA driver install
 EOD
   emsg "$HELPMSG"
   if [[ "$EUID" -ne 0 ]]; then
@@ -605,9 +635,28 @@ writeOS=0
 writeHome=0
 
 case "${1-help}" in
+menu)
+  choice=""
+  if have_gui; then
+    choice=$(zenity --list --title="Universal SteamOS Installer" \
+                    --text="Select an action" \
+                    --column="Action" --column="Description" \
+                    all      "Wipe a disk and install SteamOS" \
+                    system   "Reinstall OS partitions only (keep home)" \
+                    home     "Reformat home partitions (wipe games/data)" \
+                    chroot   "Open a shell in the installed system" \
+                    sanitize "Secure-erase a disk" \
+                    --height=340 --width=560) || exit 0
+  else
+    emsg "Select an action:"
+    select choice in all system home chroot sanitize quit; do break; done
+    [[ -n ${choice:-} && $choice != quit ]] || exit 0
+  fi
+  exec "$0" "$choice"
+  ;;
 all)
-  prompt_step "Reimage Steam Deck" "This action will reimage the Steam Deck.\nThis will permanently destroy all data on your Steam Deck and reinstall SteamOS.\n\nThis cannot be undone.\n\nChoose Proceed only if you wish to clear and reimage this device."
   select_disk
+  prompt_step "Reimage Device" "This action will reimage the disk $DISK.\nThis will permanently destroy all data on $DISK and reinstall SteamOS.\n\nThis cannot be undone.\n\nChoose Proceed only if you wish to clear and reimage this disk."
   sanitize_all
   writePartitionTable=1
   writeOS=1
@@ -616,26 +665,29 @@ all)
   prompt_reboot "Reimaging complete."
   ;;
 system)
-  prompt_step "Reinstall SteamOS" "This action will reinstall SteamOS on the Steam Deck, while attempting to preserve your games and personal content.\nSystem customizations may be lost.\n\nChoose Proceed to reinstall SteamOS on your device."
+  select_disk
+  prompt_step "Reinstall SteamOS" "This action will reinstall SteamOS on $DISK, while attempting to preserve your games and personal content.\nSystem customizations may be lost.\n\nChoose Proceed to reinstall SteamOS on this disk."
   writeOS=1
   repair_steps
   prompt_reboot "SteamOS reinstall complete."
   ;;
 home)
-  prompt_step "Delete local user data" "This action will reformat the home partitions on your Steam Deck.\nThis will destroy downloaded games and all personal content stored on the Deck, including system configuration.\n\nThis action cannot be undone.\n\nChoose Proceed to reformat all user home partitions."
+  select_disk
+  prompt_step "Delete local user data" "This action will reformat the home partitions on $DISK.\nThis will destroy downloaded games and all personal content, including system configuration.\n\nThis action cannot be undone.\n\nChoose Proceed to reformat all user home partitions."
   writeHome=1
   repair_steps
   prompt_reboot "User partitions have been reformatted."
   ;;
 chroot)
+  select_disk
   chroot_primary
   ;;
 sanitize)
-  prompt_step "Clear and sanitize NVME disk" "This action will kick off an NVME sanitize on the Steam Deck, irrevocably deleting all user data.\n\nThis action cannot be undone.\n\nChoose Proceed only if you want to remove all data from the attached Steam Deck primary drive."
+  select_disk
+  prompt_step "Clear and sanitize disk" "This action will kick off a sanitize/secure-erase of $DISK, irrevocably deleting all data on it.\n\nThis action cannot be undone.\n\nChoose Proceed only if you want to remove all data from this disk."
   sanitize_all
   ;;
 *)
   help
   ;;
-esac 
-
+esac

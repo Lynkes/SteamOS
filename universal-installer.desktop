@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Universal SteamOS Installer
+Comment=Install SteamOS to any disk (NVMe/SATA/eMMC)
+Exec=konsole --hide-menubar --hide-tabbar -e bash -c "sudo /home/deck/universal-installer/REPAIRDEVICE_NEW.sh menu; echo; read -r -p 'Press Enter to close...'"
+Icon=drive-harddisk
+Terminal=false
+Categories=System;
