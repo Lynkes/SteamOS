@@ -50,7 +50,7 @@ os hooks de pós-instalação, que detectam o hardware real via `lspci` /
 |---|---|---|
 | Intel Gen 8+ | Broadwell → Alder/Raptor/Meteor Lake, Iris Xe | `mesa`, `vulkan-intel` (ANV), `intel-media-driver` (VAAPI iHD), `linux-firmware-intel` |
 | Intel dedicadas | DG1, Arc A-series (DG2), Arc B-series (BMG) | idem + `i915.force_probe` / `xe.force_probe` com os device ids detectados |
-| Intel Gen 5–7.5 | Ironlake, Sandy/Ivy Bridge, Haswell, Bay Trail | `mesa` (crocus) + `libva-intel-driver` (VAAPI i965) |
+| Intel Gen 5–7.5 | Ironlake, Sandy/Ivy Bridge, Haswell, Bay Trail | `mesa` (crocus) + `libva-intel-driver` (VAAPI i965) + `vulkan-swrast` — **sem Vulkan em hardware**, ver abaixo |
 | AMD GCN 2+ / RDNA | Polaris, Vega, RDNA 1–4 | `mesa`, `vulkan-radeon` (RADV), `libva-mesa-driver`, `mesa-vdpau`, `linux-firmware-amdgpu` |
 | AMD GCN 1.0/1.1 | Tahiti, Pitcairn, Bonaire, Hawaii, Kaveri… | idem + `amdgpu.si_support=1` / `cik_support=1` (troca o driver `radeon` pelo `amdgpu`) |
 | AMD pré-GCN | TeraScale (HD 2000–6000) | `mesa` + driver `radeon` (só OpenGL, sem Vulkan) |
@@ -58,6 +58,27 @@ os hooks de pós-instalação, que detectam o hardware real via `lspci` /
 | NVIDIA Maxwell/Pascal | GTX 9xx / 10xx | `nvidia-dkms` (ramo legado) |
 | NVIDIA Kepler e anteriores | GTX 6xx/7xx e mais antigas | avisa que precisa de `nvidia-470xx-dkms`/`390xx` (AUR ou vendorizado) |
 | Híbrido (iGPU + NVIDIA) | notebooks Optimus | acrescenta `nvidia-prime` para render offload |
+
+### Intel Gen 7 e anteriores: tela piscando no Game Mode
+
+O `gamescope`, que é o Game Mode do SteamOS, **só inicia se houver um dispositivo
+Vulkan**. O ANV (driver Vulkan do Mesa para Intel) removeu o suporte a Gen7 e
+Gen7.5 faz alguns anos, então numa HD 4000 (Ivy Bridge) o pacote `vulkan-intel`
+instala normalmente e mesmo assim enumera zero dispositivos:
+
+```
+$ vulkaninfo --summary
+ERROR: Failed to detect any valid GPUs in the current config
+```
+
+Sem dispositivo Vulkan o gamescope morre ao iniciar, a sessão reinicia em loop e
+**a tela fica piscando sem nunca mostrar nada** — sintoma que parece um loop de
+reboot, mas o sistema está de pé (dá pra entrar por SSH).
+
+O hook instala `vulkan-swrast` (lavapipe) nessas GPUs pra que a sessão consiga
+subir. Funciona, mas renderiza em CPU: serve pra confirmar que o sistema está
+bom, não pra jogar. Nessas máquinas o **modo desktop** é o caminho utilizável —
+ele usa OpenGL, que o driver `crocus` entrega bem nessa geração.
 
 **CPUs**
 

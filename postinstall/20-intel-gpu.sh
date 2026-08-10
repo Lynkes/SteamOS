@@ -46,12 +46,21 @@ for id in $ids; do
 done
 discrete="${discrete%,}"
 
-pkgs="mesa lib32-mesa vulkan-intel lib32-vulkan-intel"
+pkgs="mesa lib32-mesa"
 if [[ $legacy = 1 ]]; then
+  # Nada de vulkan-intel aqui: o ANV do Mesa removeu Gen7/Gen7.5, então numa
+  # HD 4000 o ICD instala mas enumera zero dispositivos. Como o gamescope (Game
+  # Mode do SteamOS) só sobe com algum dispositivo Vulkan, sem um fallback a
+  # sessão morre e reinicia em loop - a tela fica piscando e nunca aparece nada.
+  # O lavapipe resolve isso por software; o modo desktop segue em OpenGL, que
+  # nessa geração funciona bem via crocus.
   hlog "Geração pré-Broadwell: VA-API via i965 (libva-intel-driver)"
-  pkgs="$pkgs libva-intel-driver lib32-libva-intel-driver"
+  hwarn "Esta GPU não tem Vulkan em hardware - o Mesa não suporta mais Gen7/7.5."
+  hwarn "Instalando lavapipe (vulkan-swrast) para o gamescope conseguir iniciar."
+  hwarn "A sessão sobe, mas renderizando em CPU: use o modo desktop para algo utilizável."
+  pkgs="$pkgs libva-intel-driver lib32-libva-intel-driver vulkan-swrast lib32-vulkan-swrast"
 else
-  pkgs="$pkgs intel-media-driver linux-firmware-intel"
+  pkgs="$pkgs vulkan-intel lib32-vulkan-intel intel-media-driver linux-firmware-intel"
 fi
 
 params=""
