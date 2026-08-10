@@ -106,7 +106,13 @@ cmd() { showcmd "$@"; "$@"; }
 
 # Helper to format
 fmt_ext4()  { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.ext4 -F -L "$1" "$2"; }
-fmt_fat32() { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.vfat -n"$1" "$2"; }
+# Plain FAT, whatever size mkfs.vfat picks - FAT16 on the 64MiB efi-A/efi-B.
+# That is fine there: those partitions are Microsoft basic data, not an ESP, so
+# the firmware never looks at them; only steamcl and grub read them, and both
+# handle FAT12/16/32.  Forcing FAT32 would actually break them on 4Kn disks,
+# where 64MiB cannot reach the 65525 cluster minimum.  Do NOT use this for the
+# ESP - see fmt_esp below, and note the old name (fmt_fat32) hid exactly that.
+fmt_fat()   { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.vfat -n"$1" "$2"; }
 
 # The ESP is read by the firmware itself, and UEFI only guarantees FAT32 support
 # for the ESP of a fixed disk.  Left to itself mkfs.vfat picks FAT16 on a volume
@@ -495,8 +501,8 @@ repair_steps(){
     # Set up ESP/EFI boot partitions
     estat "Creating boot partitions"
     fmt_esp   esp  "$(diskpart $FS_ESP)"
-    fmt_fat32 efi  "$(diskpart $FS_EFI_A)"
-    fmt_fat32 efi  "$(diskpart $FS_EFI_B)"
+    fmt_fat   efi  "$(diskpart $FS_EFI_A)"
+    fmt_fat   efi  "$(diskpart $FS_EFI_B)"
   fi
 
   if [[ $writeHome = 1 ]]; then
