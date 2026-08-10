@@ -31,6 +31,7 @@ menu de instalação.
 | `system` | reinstala só as partições de sistema (preserva a home) |
 | `home` | reformata as partições home (apaga jogos e dados) |
 | `drivers` | (re)executa só os hooks de driver num sistema já instalado |
+| `bootfix` | refaz a ESP em FAT32 e regenera bootloader + config de boot A/B |
 | `chroot` | abre um shell dentro do sistema instalado |
 | `sanitize` | secure-erase do disco (NVMe sanitize / hdparm / blkdiscard) |
 
@@ -192,14 +193,23 @@ O firmware não achou nada pra carregar. Em PC comum, na ordem de probabilidade:
    se existe `/EFI/BOOT/BOOTX64.EFI` na ESP (o `--force-extra-removable` do
    `steamcl-install` deveria criar).
 
-Dá pra testar 3 e 4 sem reinstalar tudo, pela recovery image:
+Confirme o caso 3 com um comando só, pela recovery image:
 
 ```bash
-sudo file -s /dev/nvme0n1p1                       # tipo de FAT da ESP
-sudo mkfs.vfat -F 32 -n esp /dev/nvme0n1p1        # refaz a ESP em FAT32
-sudo steamos-chroot --no-overlay --disk /dev/nvme0n1 --partset A -- \
-     steamcl-install --flags restricted --force-extra-removable
+sudo file -s /dev/nvme0n1p1     # "FAT (16 bit)" => é isso
 ```
+
+Se for, o alvo `bootfix` conserta **sem reinstalar e sem perder jogos ou dados**:
+
+```bash
+sudo ./REPAIRDEVICE_NEW.sh bootfix
+```
+
+Ele refaz a ESP em FAT32, regenera a configuração de boot A/B e reinstala o
+bootloader. Não tente fazer só o `mkfs.vfat` seguido de `steamcl-install`: o
+`mkfs` também apaga `/esp/SteamOS/conf`, que é onde fica a configuração A/B
+lida pelo steamcl, e sem ela o bootloader sobe sem nenhuma imagem pra
+carregar. O `bootfix` cuida das duas coisas na ordem certa.
 
 **Passa pelo bootloader mas reinicia durante o kernel, ou chega na interface e
 reinicia.** Aí é o sistema instalado, não o firmware — vá no journal:

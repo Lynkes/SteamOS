@@ -349,6 +349,44 @@ install_drivers()
   done
 }
 
+# Rebuild the whole boot chain of an already installed disk (the "bootfix"
+# target), without touching the OS or the user data.
+#
+# Reformats the ESP as FAT32 and regenerates everything that lives on it.  Note
+# that the A/B boot configuration under /esp/SteamOS/conf is destroyed together
+# with the ESP, so finalize_part has to run again for both partsets - installing
+# steamcl alone would leave the bootloader with no image to chainload.
+#
+# Fixes an install made by an older version of this script, which created the
+# ESP with the mkfs.vfat default (FAT16) that many PC firmwares refuse to read.
+fix_bootloader()
+{
+  local rootdev partset
+  for partset in A B; do
+    case $partset in
+      A) rootdev="$(diskpart $FS_ROOT_A)" ;;
+      B) rootdev="$(diskpart $FS_ROOT_B)" ;;
+    esac
+    [[ $(blkid -o value -s PARTLABEL "$rootdev" 2>/dev/null || true) = "rootfs-$partset" ]] \
+      || die "$rootdev is not a rootfs-$partset partition - is $DISK really a SteamOS install?"
+  done
+
+  check_firmware
+
+  estat "Recreating the EFI system partition as FAT32"
+  fmt_esp esp "$(diskpart $FS_ESP)"
+
+  estat "Regenerating boot configurations"
+  finalize_part A
+  finalize_part B
+
+  estat "Installing the bootloader on the EFI system partition"
+  cmd steamos-chroot --no-overlay --disk "$DISK" --partset A -- \
+    steamcl-install --flags restricted --force-extra-removable
+
+  estat "Boot chain rebuilt. ESP is now: $(blkid -o value -s VERSION "$(diskpart $FS_ESP)" 2>/dev/null || echo '?')"
+}
+
 ##
 ## Repair functions
 ##
@@ -695,6 +733,7 @@ Possible targets:
     system : reinstall SteamOS on the system partitions of the selected disk.
     home : remove games and personalization from the selected disk.
     drivers : (re)run the driver hooks (GPU / CPU microcode) on an installed system.
+    bootfix : rebuild the boot chain (FAT32 ESP + bootloader) of an installed system.
     chroot : chroot to the primary SteamOS partition set.
     sanitize : perform a sanitize/secure-erase operation on the selected disk.
 
@@ -729,12 +768,13 @@ menu)
                     system   "Reinstall OS partitions only (keep home)" \
                     home     "Reformat home partitions (wipe games/data)" \
                     drivers  "Install GPU / CPU drivers on an existing install" \
+                    bootfix  "Rebuild the boot chain (machine reboots with no bootloader)" \
                     chroot   "Open a shell in the installed system" \
                     sanitize "Secure-erase a disk" \
-                    --height=380 --width=560) || exit 0
+                    --height=420 --width=600) || exit 0
   else
     emsg "Select an action:"
-    select choice in all system home drivers chroot sanitize quit; do break; done
+    select choice in all system home drivers bootfix chroot sanitize quit; do break; done
     [[ -n ${choice:-} && $choice != quit ]] || exit 0
   fi
   exec "$0" "$choice"
@@ -762,6 +802,12 @@ home)
   writeHome=1
   repair_steps
   prompt_reboot "User partitions have been reformatted."
+  ;;
+bootfix)
+  select_disk
+  prompt_step "Rebuild the boot chain" "This action will recreate the EFI system partition of $DISK as FAT32 and regenerate the bootloader and the A/B boot configuration.\n\nThe installed system, your games and your data are not touched, but anything else stored on that EFI partition is erased.\n\nUse this if the machine reboots without ever showing a bootloader.\n\nChoose Proceed to rebuild the boot chain."
+  fix_bootloader
+  prompt_reboot "Boot chain rebuilt."
   ;;
 drivers)
   select_disk
