@@ -100,25 +100,52 @@ _pacman_synced=0
 
 tlog() { echo "   [target] $*"; }
 
+_was_ro_mount=0
+
 unlock_rootfs()
 {
+  # O steamos-chroot entrega a rootfs montada como ro, e o pacman do SteamOS
+  # guarda o banco em /usr/lib/holo/pacmandb - dentro da própria rootfs, não
+  # em /var. Sem remontar rw ele falha com "unable to lock database", e a
+  # propriedade btrfs nem pode ser alterada enquanto a montagem for ro.
+  if findmnt -rno OPTIONS / 2>/dev/null | tr ',' '\n' | grep -qx ro; then
+    _was_ro_mount=1
+    mount -o remount,rw / 2>/dev/null || tlog "aviso: não consegui remontar / como rw"
+  fi
+
+  # Só agora, com a montagem rw, dá para mexer na propriedade read-only.
   if command -v steamos-readonly >/dev/null 2>&1; then
-    steamos-readonly disable || true
+    steamos-readonly disable >/dev/null 2>&1 || true
   fi
   btrfs property set / ro false 2>/dev/null || true
 }
 
 lock_rootfs()
 {
+  sync 2>/dev/null || true
   if command -v steamos-readonly >/dev/null 2>&1; then
-    steamos-readonly enable || true
+    steamos-readonly enable >/dev/null 2>&1 || true
   fi
+  # Devolve a montagem ao estado em que o steamos-chroot a entregou.
+  [ "${_was_ro_mount:-0}" = 1 ] && mount -o remount,ro / 2>/dev/null
+  return 0
 }
 
 # Inicializa keyring e sincroniza os repositórios uma única vez por chroot.
 pacman_sync()
 {
   [ "$_pacman_synced" = 1 ] && return 0
+
+  # Uma execução anterior interrompida deixa um db.lck que bloqueia tudo.
+  # O caminho vem do pacman-conf: no SteamOS o DBPath é /usr/lib/holo/pacmandb,
+  # e não o /var/lib/pacman que se esperaria.
+  local db
+  db="$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman/)"
+  if [ -e "$db/db.lck" ] && ! pgrep -x pacman >/dev/null 2>&1; then
+    tlog "removendo lock órfão do pacman em $db"
+    rm -f "$db/db.lck"
+  fi
+
   if command -v pacman-key >/dev/null 2>&1; then
     pacman-key --init >/dev/null 2>&1 || true
     # popula todos os keyrings disponíveis (archlinux + holo no SteamOS)
