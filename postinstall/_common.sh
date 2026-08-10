@@ -104,19 +104,26 @@ _was_ro_mount=0
 
 unlock_rootfs()
 {
-  # O steamos-chroot entrega a rootfs montada como ro, e o pacman do SteamOS
-  # guarda o banco em /usr/lib/holo/pacmandb - dentro da própria rootfs, não
-  # em /var. Sem remontar rw ele falha com "unable to lock database", e a
-  # propriedade btrfs nem pode ser alterada enquanto a montagem for ro.
+  # A ordem aqui importa e não é a intuitiva.
+  #
+  # 1. A propriedade read-only do subvolume btrfs vem primeiro: enquanto ela
+  #    estiver marcada, o kernel recusa promover a montagem para rw e o
+  #    "mount -o remount,rw" falha em silêncio. É o estado normal do SteamOS -
+  #    e também o que o lock_rootfs abaixo deixa ao terminar, então sem isso a
+  #    segunda execução de um hook quebraria.
+  if command -v steamos-readonly >/dev/null 2>&1; then
+    steamos-readonly disable >/dev/null 2>&1 || true
+  fi
+
+  # 2. Agora sim a montagem. O steamos-chroot entrega a rootfs como ro, e o
+  #    pacman do SteamOS guarda o banco em /usr/lib/holo/pacmandb - dentro da
+  #    própria rootfs, não em /var - então sem rw ele falha com
+  #    "unable to lock database".
   if findmnt -rno OPTIONS / 2>/dev/null | tr ',' '\n' | grep -qx ro; then
     _was_ro_mount=1
     mount -o remount,rw / 2>/dev/null || tlog "aviso: não consegui remontar / como rw"
   fi
 
-  # Só agora, com a montagem rw, dá para mexer na propriedade read-only.
-  if command -v steamos-readonly >/dev/null 2>&1; then
-    steamos-readonly disable >/dev/null 2>&1 || true
-  fi
   btrfs property set / ro false 2>/dev/null || true
 }
 
