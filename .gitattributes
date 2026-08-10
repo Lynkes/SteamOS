@@ -1,0 +1,11 @@
+# Este projeto roda em Linux (sessão live da SteamOS Repair Image).
+# Scripts com CRLF quebram na execução ("bad interpreter: /bin/bash^M"),
+# então tudo que é texto é normalizado para LF no repositório.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.desktop text eol=lf
+*.md      text eol=lf
+
+*.pkg.tar.zst binary
+*.img         binary

@@ -11,7 +11,11 @@
 #   DISK=/dev/sdX     skip the disk picker and use this disk
 #   NOPROMPT=1        skip confirmation dialogs
 #   POWEROFF=1        power off instead of reboot when done
-#   NVIDIA=0          never install NVIDIA drivers / NVIDIA=1 force install
+#   NVIDIA=0|1        never / always install the proprietary NVIDIA drivers
+#   INTEL_GPU=0|1     never / always install the Intel GPU stack
+#   AMD_GPU=0|1       never / always install the AMD GPU stack
+#   MICROCODE=0       never install CPU microcode (intel-ucode / amd-ucode)
+# See postinstall/*.sh for the per-hook overrides.
 #
 
 set -eu
@@ -253,23 +257,49 @@ is_steam_deck()
 ## Post-install hooks
 ##
 
-# Run every script in postinstall/ against a partset. Each hook decides for
-# itself whether it applies (e.g. nvidia.sh checks lspci) and receives:
-#   DISK, DISK_SUFFIX, PARTSET, TARGET_ROOT_DEV, PAYLOAD_DIR
+# Run every script in postinstall/ against a partset, in filename order.
+# Files starting with "_" are shared libraries, not hooks, and are skipped.
+# Each hook decides for itself whether it applies (e.g. 40-nvidia.sh checks
+# lspci) and receives:
+#   DISK, DISK_SUFFIX, PARTSET, TARGET_ROOT_DEV, PAYLOAD_DIR, POSTINSTALL_DIR
 #   $1 partset name
 #   $2 rootfs device of that partset
 run_postinstall()
 {
-  local partset="$1" rootdev="$2" hook
+  local partset="$1" rootdev="$2" hook name
   [[ -d $POSTINSTALL_DIR ]] || return 0
   for hook in "$POSTINSTALL_DIR"/*.sh; do
     [[ -e $hook ]] || continue
-    estat "Post-install hook: $(basename "$hook") (partset $partset)"
+    name="$(basename "$hook")"
+    [[ $name != _* ]] || continue
+    estat "Post-install hook: $name (partset $partset)"
     if ! DISK="$DISK" DISK_SUFFIX="$DISK_SUFFIX" PARTSET="$partset" \
          TARGET_ROOT_DEV="$rootdev" PAYLOAD_DIR="$SCRIPT_DIR" \
+         POSTINSTALL_DIR="$POSTINSTALL_DIR" \
          bash "$hook"; then
-      ewarn "Hook $(basename "$hook") failed on partset $partset - continuing"
+      ewarn "Hook $name failed on partset $partset - continuing"
     fi
+  done
+}
+
+# Re-run the driver hooks against an already installed system and regenerate
+# its boot configuration (the "drivers" target). Non-destructive.
+install_drivers()
+{
+  local partset rootdev
+  for partset in A B; do
+    case $partset in
+      A) rootdev="$(diskpart $FS_ROOT_A)" ;;
+      B) rootdev="$(diskpart $FS_ROOT_B)" ;;
+    esac
+    if [[ $(blkid -o value -s PARTLABEL "$rootdev" 2>/dev/null || true) != "rootfs-$partset" ]]; then
+      ewarn "$rootdev is not a rootfs-$partset partition - skipping partset $partset"
+      continue
+    fi
+    run_postinstall "$partset" "$rootdev"
+    estat "Regenerating boot configuration for partset $partset"
+    cmd steamos-chroot --no-overlay --disk "$DISK" --partset "$partset" -- update-grub \
+      || ewarn "update-grub failed on partset $partset - continuing"
   done
 }
 
@@ -614,12 +644,16 @@ Possible targets:
     all : permanently destroy all data on the selected disk, and reinstall SteamOS.
     system : reinstall SteamOS on the system partitions of the selected disk.
     home : remove games and personalization from the selected disk.
+    drivers : (re)run the driver hooks (GPU / CPU microcode) on an installed system.
     chroot : chroot to the primary SteamOS partition set.
     sanitize : perform a sanitize/secure-erase operation on the selected disk.
 
 Environment:
-    DISK=/dev/sdX  preselect target disk    NOPROMPT=1  skip confirmations
-    NVIDIA=0|1     force-skip/force NVIDIA driver install
+    DISK=/dev/sdX   preselect target disk   NOPROMPT=1  skip confirmations
+    NVIDIA=0|1      force-skip/force the proprietary NVIDIA driver
+    INTEL_GPU=0|1   force-skip/force the Intel GPU stack (Mesa/Vulkan/VA-API)
+    AMD_GPU=0|1     force-skip/force the AMD GPU stack (Mesa/RADV/VA-API)
+    MICROCODE=0     skip CPU microcode (intel-ucode / amd-ucode)
 EOD
   emsg "$HELPMSG"
   if [[ "$EUID" -ne 0 ]]; then
@@ -644,12 +678,13 @@ menu)
                     all      "Wipe a disk and install SteamOS" \
                     system   "Reinstall OS partitions only (keep home)" \
                     home     "Reformat home partitions (wipe games/data)" \
+                    drivers  "Install GPU / CPU drivers on an existing install" \
                     chroot   "Open a shell in the installed system" \
                     sanitize "Secure-erase a disk" \
-                    --height=340 --width=560) || exit 0
+                    --height=380 --width=560) || exit 0
   else
     emsg "Select an action:"
-    select choice in all system home chroot sanitize quit; do break; done
+    select choice in all system home drivers chroot sanitize quit; do break; done
     [[ -n ${choice:-} && $choice != quit ]] || exit 0
   fi
   exec "$0" "$choice"
@@ -677,6 +712,12 @@ home)
   writeHome=1
   repair_steps
   prompt_reboot "User partitions have been reformatted."
+  ;;
+drivers)
+  select_disk
+  prompt_step "Install drivers" "This action will (re)run the driver hooks (GPU stack, CPU microcode) against the SteamOS installation on $DISK.\n\nNo data is erased. An internet connection is needed unless you vendored the packages under pkgs/.\n\nChoose Proceed to install the drivers detected for this machine."
+  install_drivers
+  prompt_reboot "Driver installation complete."
   ;;
 chroot)
   select_disk

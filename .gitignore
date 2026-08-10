@@ -1,0 +1,37 @@
+# Pacotes vendorizados para instalação offline dos drivers.
+# Ficam no pendrive (ver README), são grandes e dependem da versão do SteamOS.
+pkgs/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+
+# Payloads de firmware vendorizados (VENDORED_BIOS_UPDATE / VENDORED_CONTROLLER_UPDATE)
+jupiter-bios/
+jupiter-controller-fw/
+
+# Imagens de disco: recovery da Valve e discos de teste em VM
+*.img
+*.iso
+*.raw
+*.qcow2
+*.vdi
+*.vmdk
+
+# Saída de execução / depuração
+*.log
+*.tmp
+*.orig
+*.rej
+core
+
+# Configuração local do Claude Code (a compartilhada seria .claude/settings.json)
+.claude/settings.local.json
+
+# Lixo de editor e de sistema operacional
+*~
+*.sw[a-p]
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
