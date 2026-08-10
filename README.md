@@ -187,17 +187,20 @@ O firmware não achou nada pra carregar. Em PC comum, na ordem de probabilidade:
    em UEFI-only. O instalador avisa se ele próprio bootou em modo legado.
 3. **ESP em FAT16.** A UEFI só garante FAT32 na ESP de disco fixo, e o
    `mkfs.vfat` escolhe FAT16 sozinho num volume de 256MiB. Versões antigas
-   deste script formatavam assim; hoje o `fmt_esp` força `-F 32`. Confira com
-   `sudo file -s /dev/sdX1` — tem que dizer `FAT (32 bit)`.
+   deste script formatavam assim; hoje o `fmt_esp` força `-F 32`.
 4. **Nenhuma entrada de boot na NVRAM.** Confira com `sudo efibootmgr -v` e veja
    se existe `/EFI/BOOT/BOOTX64.EFI` na ESP (o `--force-extra-removable` do
    `steamcl-install` deveria criar).
 
-Confirme o caso 3 com um comando só, pela recovery image:
+Confirme o caso 3 pela recovery image. Use `blkid`/`lsblk` (util-linux, sempre
+presentes) — `file` e `hdparm` **não vêm** na imagem da Valve:
 
 ```bash
-sudo file -s /dev/nvme0n1p1     # "FAT (16 bit)" => é isso
+sudo blkid -p -o export /dev/nvme0n1p1 | grep -Ei 'type|version'   # VERSION="FAT16" => é isso
+sudo lsblk -o NAME,FSTYPE,FSVER,LABEL,PARTLABEL,SIZE /dev/nvme0n1  # visão geral
 ```
+
+`FAT16` em `efi-A`/`efi-B` é normal e não precisa mudar; só a `esp` importa.
 
 Se for, o alvo `bootfix` conserta **sem reinstalar e sem perder jogos ou dados**:
 
