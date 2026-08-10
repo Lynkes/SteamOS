@@ -108,6 +108,22 @@ cmd() { showcmd "$@"; "$@"; }
 fmt_ext4()  { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.ext4 -F -L "$1" "$2"; }
 fmt_fat32() { [[ $# -eq 2 && -n $1 && -n $2 ]] || die; cmd mkfs.vfat -n"$1" "$2"; }
 
+# The ESP is read by the firmware itself, and UEFI only guarantees FAT32 support
+# for the ESP of a fixed disk.  Left to itself mkfs.vfat picks FAT16 on a volume
+# this small, which the Steam Deck firmware accepts but plenty of PC firmwares
+# do not - they simply find nothing bootable and reset.  Force FAT32, and fall
+# back to the default if the geometry cannot hold a FAT32 (e.g. 4Kn sectors,
+# where 256MiB is just under the 65525 cluster minimum).
+fmt_esp()
+{
+  [[ $# -eq 2 && -n $1 && -n $2 ]] || die
+  if ! cmd mkfs.vfat -F 32 -n"$1" "$2"; then
+    ewarn "Could not create a FAT32 ESP on $2 - falling back to the mkfs.vfat default."
+    ewarn "If the machine reboots without ever showing a bootloader, this is the first suspect."
+    cmd mkfs.vfat -n"$1" "$2"
+  fi
+}
+
 ##
 ## Prompt mechanics - Zenity when a display is available, terminal fallback otherwise
 ##
@@ -253,6 +269,36 @@ is_steam_deck()
   [[ $product = Jupiter* || $product = Galileo* ]]
 }
 
+# Warn about firmware settings that make the installed system unbootable in a
+# way that looks like a reboot loop: the machine resets without ever showing a
+# bootloader.  Both conditions are the user's to fix in the firmware setup, so
+# this only warns - the install itself is still valid.
+check_firmware()
+{
+  if [[ ! -d /sys/firmware/efi ]]; then
+    ewarn "This installer booted in legacy/CSM mode, not UEFI."
+    ewarn "SteamOS boots only via UEFI - the installed system will not be found."
+    ewarn "Set the firmware to UEFI-only (CSM disabled) and install again."
+    return 0
+  fi
+
+  local sb=""
+  local var
+  for var in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [[ -e $var ]] || continue
+    # 4 bytes of attributes followed by the one byte value
+    sb="$(od -An -t u1 "$var" 2>/dev/null | tr -s ' ' | awk '{print $NF}')"
+    break
+  done
+
+  if [[ $sb = 1 ]]; then
+    ewarn "Secure Boot is enabled on this machine."
+    ewarn "Valve's bootloader (steamcl.efi) is not signed for third-party firmware,"
+    ewarn "so the target may reset without ever showing a bootloader."
+    ewarn "Disable Secure Boot in the firmware setup before booting the result."
+  fi
+}
+
 ##
 ## Post-install hooks
 ##
@@ -373,6 +419,10 @@ trap exithandler EXIT
 #
 repair_steps(){
 
+  if [[ $writeOS = 1 ]]; then
+    check_firmware
+  fi
+
   if [[ $writePartitionTable = 1 ]]; then
     check_disk_size
     estat "Write known partition table"
@@ -406,7 +456,7 @@ repair_steps(){
   if [[ $writeOS = 1 ]]; then
     # Set up ESP/EFI boot partitions
     estat "Creating boot partitions"
-    fmt_fat32 esp  "$(diskpart $FS_ESP)"
+    fmt_esp   esp  "$(diskpart $FS_ESP)"
     fmt_fat32 efi  "$(diskpart $FS_EFI_A)"
     fmt_fat32 efi  "$(diskpart $FS_EFI_B)"
   fi

@@ -171,6 +171,55 @@ O hook detecta os `.pkg.tar.zst` do seu subdiretório e instala com `pacman -U`,
 offline — nesse caso ele nem tenta a rede. Pacotes soltos direto em `pkgs/`
 continuam funcionando para o hook NVIDIA (comportamento antigo).
 
+## Loop de reboot depois de instalar
+
+Se a máquina reinicia sozinha em ciclo, o primeiro passo é separar **onde** ela
+reinicia — a causa é completamente diferente em cada caso.
+
+**Reinicia antes de mostrar qualquer coisa** (nem bootloader, nem kernel).
+O firmware não achou nada pra carregar. Em PC comum, na ordem de probabilidade:
+
+1. **Secure Boot ligado.** O `steamcl.efi` da Valve não é assinado para firmware
+   de terceiros. Desligue o Secure Boot no setup. O instalador avisa quando
+   detecta isso, mas quem tem que desligar é você, no firmware.
+2. **CSM / boot legado ligado.** O SteamOS só boota por UEFI. Deixe o firmware
+   em UEFI-only. O instalador avisa se ele próprio bootou em modo legado.
+3. **ESP em FAT16.** A UEFI só garante FAT32 na ESP de disco fixo, e o
+   `mkfs.vfat` escolhe FAT16 sozinho num volume de 256MiB. Versões antigas
+   deste script formatavam assim; hoje o `fmt_esp` força `-F 32`. Confira com
+   `sudo file -s /dev/sdX1` — tem que dizer `FAT (32 bit)`.
+4. **Nenhuma entrada de boot na NVRAM.** Confira com `sudo efibootmgr -v` e veja
+   se existe `/EFI/BOOT/BOOTX64.EFI` na ESP (o `--force-extra-removable` do
+   `steamcl-install` deveria criar).
+
+Dá pra testar 3 e 4 sem reinstalar tudo, pela recovery image:
+
+```bash
+sudo file -s /dev/nvme0n1p1                       # tipo de FAT da ESP
+sudo mkfs.vfat -F 32 -n esp /dev/nvme0n1p1        # refaz a ESP em FAT32
+sudo steamos-chroot --no-overlay --disk /dev/nvme0n1 --partset A -- \
+     steamcl-install --flags restricted --force-extra-removable
+```
+
+**Passa pelo bootloader mas reinicia durante o kernel, ou chega na interface e
+reinicia.** Aí é o sistema instalado, não o firmware — vá no journal:
+
+```bash
+sudo mkdir -p /mnt/var && sudo mount /dev/nvme0n1p6 /mnt/var    # var-A
+sudo journalctl -D /mnt/var/log/journal --list-boots | tail
+sudo journalctl -D /mnt/var/log/journal -b -1 -p warning --no-pager | tail -60
+sudo journalctl -D /mnt/var/log/journal -u steamos-finalize-install \
+                                        -u jupiter-first-boot --no-pager
+```
+
+E o contador A/B do bootloader, que alterna de partset quando um boot não é
+marcado como bem-sucedido (`boot-attempts`, `boot-other`, `image-invalid`):
+
+```bash
+sudo mkdir -p /mnt/esp && sudo mount /dev/nvme0n1p1 /mnt/esp
+sudo cat /mnt/esp/SteamOS/conf/*.conf
+```
+
 ## Testando em VM (recomendado)
 
 ```bash
